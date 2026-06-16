@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich import print
+
+from slimder_man.adapters.registry import get_adapter
+from slimder_man.adapters.tiny import TinyMoEForCausalLM
+from slimder_man.analyze.architecture import describe_model
+from slimder_man.analyze.recommender import recommend
+from slimder_man.analyze.reports import write_analysis_report
+from slimder_man.calibration.collectors import collect_tiny_calibration
+from slimder_man.calibration.datasets import sample_calibration_tokens
+from slimder_man.compression.apply import compress_tiny_model
+from slimder_man.compression.manifests import load_manifest
+from slimder_man.compression.validate import validate_tiny_model
+from slimder_man.config.defaults import tiny_default_config
+from slimder_man.config.schema import SlimderConfig, load_config, save_config
+from slimder_man.distill.train_loop import train_tiny_distill
+from slimder_man.eval.perplexity import tiny_perplexity
+from slimder_man.orchestration.skypilot import skypilot_yaml
+from slimder_man.orchestration.ssh import ssh_dry_run_commands
+from slimder_man.ui.app import create_app
+from slimder_man.utils.hashing import sha256_file
+from slimder_man.utils.json import write_json
+
+app = typer.Typer(no_args_is_help=True)
+
+
+def _echo(data: dict, as_json: bool) -> None:
+    if as_json:
+        typer.echo(json.dumps(data, indent=2, sort_keys=True))
+    else:
+        print(data)
+
+
+def _load_or_default(path: Optional[Path]) -> SlimderConfig:
+    return load_config(path) if path else tiny_default_config()
+
+
+def _tiny_teacher(cfg: SlimderConfig) -> TinyMoEForCausalLM:
+    if cfg.teacher.load_mode != "tiny":
+        raise typer.BadParameter("Tiny-only operation requested for a non-tiny teacher")
+    return TinyMoEForCausalLM()
+
+
+def _load_transformers_model(cfg: SlimderConfig):
+    from transformers import AutoModelForCausalLM
+    import torch
+
+    dtype_map = {"bfloat16": torch.bfloat16, "bf16": torch.bfloat16, "float16": torch.float16, "fp16": torch.float16, "float32": torch.float32, "fp32": torch.float32}
+    return AutoModelForCausalLM.from_pretrained(
+        cfg.teacher.model_id_or_path,
+        revision=cfg.teacher.revision,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+        torch_dtype=dtype_map.get(cfg.teacher.dtype, torch.float32),
+        device_map=cfg.teacher.device_map,
+    )
+
+
+def _load_model(cfg: SlimderConfig):
+    return _tiny_teacher(cfg) if cfg.teacher.load_mode == "tiny" else _load_transformers_model(cfg)
+
+
+@app.callback()
+def main() -> None:
+    """Slimder Man CLI."""
+
+
+@app.command()
+def ui(test_mode: bool = False, host: str = "127.0.0.1", port: int = 7860, json_output: bool = typer.Option(False, "--json")) -> None:
+    demo = create_app(test_mode=test_mode)
+    if test_mode:
+        _echo({"status": "started", "test_mode": True}, json_output)
+        return
+    demo.launch(server_name=host, server_port=port)
+
+
+@app.command()
+def init_config(out: Path = Path("config.yaml"), json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = tiny_default_config()
+    save_config(cfg, out)
+    _echo({"config": str(out)}, json_output)
+
+
+@app.command()
+def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    model = _load_model(cfg)
+    arch = describe_model(model)
+    if cfg.teacher.load_mode != "tiny":
+        out_dir = Path(cfg.project.output_dir) / "analysis"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        recs = recommend(arch, cfg.compression.preset)
+        write_json(out_dir / "architecture.json", arch)
+        write_analysis_report(out_dir / "analysis_report.md", arch, recs, warnings=["Calibration is skipped for non-tiny analyze unless a full model run is explicitly provisioned."])
+        _echo({"architecture": arch, "analysis_dir": str(out_dir), "recommendations": recs}, json_output)
+        return
+    batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
+    cal = collect_tiny_calibration(model, batches)
+    out_dir = Path(cfg.project.output_dir) / "analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    recs = recommend(arch, cfg.compression.preset)
+    write_json(out_dir / "architecture.json", arch)
+    write_json(out_dir / "calibration_manifest.json", cal_manifest)
+    write_json(out_dir / "routing_summary.json", {"representation": cal.representation})
+    write_analysis_report(out_dir / "analysis_report.md", arch, recs)
+    _echo({"architecture": arch, "analysis_dir": str(out_dir), "recommendations": recs}, json_output)
+
+
+@app.command(name="recommend")
+def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "balanced_50", json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    model = _load_model(cfg)
+    recs = recommend(describe_model(model), preset)
+    _echo({"preset": preset, "candidates": recs}, json_output)
+
+@app.command()
+def compress(config: Path, stage: int = 1, json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    if cfg.teacher.load_mode != "tiny":
+        raise typer.BadParameter("Full-checkpoint Qwen3-Next compression is not enabled in this v1 build; use analyze/recommend or the tiny smoke workflow.")
+    teacher = _tiny_teacher(cfg)
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+    cal = collect_tiny_calibration(teacher, batches)
+    out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
+    student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir)
+    _echo({"checkpoint": str(out_dir), "manifest": manifest, "params": sum(p.numel() for p in student.parameters())}, json_output)
+
+
+@app.command()
+def distill(config: Path, stage: int = 1, resume: bool = False, json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    teacher = _tiny_teacher(cfg)
+    ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
+    resume_dir = Path(cfg.project.output_dir) / "training" / "resume_model"
+    if resume and resume_dir.exists():
+        student = TinyMoEForCausalLM.from_pretrained(resume_dir)
+    else:
+        student = TinyMoEForCausalLM.from_pretrained(ckpt) if ckpt.exists() else TinyMoEForCausalLM()
+    result = train_tiny_distill(teacher, student, cfg, Path(cfg.project.output_dir) / "training", resume=resume)
+    _echo(result, json_output)
+
+
+@app.command()
+def run(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    if cfg.teacher.load_mode != "tiny":
+        raise typer.BadParameter("Full non-tiny run is intentionally gated in v1; use analyze/recommend for HF models and tiny run for end-to-end smoke.")
+    teacher = _tiny_teacher(cfg)
+    arch = describe_model(teacher)
+    batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+    cal = collect_tiny_calibration(teacher, batches)
+    out_dir = Path(cfg.project.output_dir)
+    write_json(out_dir / "analysis" / "architecture.json", arch)
+    write_json(out_dir / "analysis" / "calibration_manifest.json", cal_manifest)
+    write_analysis_report(out_dir / "analysis" / "analysis_report.md", arch, recommend(arch, cfg.compression.preset))
+    student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir / "checkpoints" / "stage_1_compressed")
+    train = train_tiny_distill(teacher, student, cfg, out_dir / "training", resume=False)
+    eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+    ppl = tiny_perplexity(student, eval_batches[:8])
+    gen = student.generate(eval_batches[0][:, :2], max_new_tokens=8)
+    result = {"analysis": str(out_dir / "analysis"), "manifest": manifest, "training": train, "perplexity": ppl, "generated_shape": list(gen.shape)}
+    write_json(out_dir / "run_summary.json", result)
+    _echo(result, json_output)
+
+
+@app.command()
+def eval(checkpoint: Path, tasks: str = "", json_output: bool = typer.Option(False, "--json")) -> None:
+    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
+    cfg = tiny_default_config()
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
+    _echo({"perplexity": tiny_perplexity(model, batches[:8]), "tasks": [x for x in tasks.split(",") if x]}, json_output)
+
+
+@app.command()
+def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    if cfg.project.paper_faithful:
+        raise typer.BadParameter("paper_faithful mode rejects quantization")
+    out_dir = Path(cfg.project.output_dir) / "quantized"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
+    model.save_pretrained(out_dir)
+    manifest = {
+        "mode": cfg.quantization.mode,
+        "source_checkpoint": str(checkpoint),
+        "target_avg_bits": cfg.quantization.target_avg_bits,
+        "artifact_hashes": {
+            name: sha256_file(out_dir / name)
+            for name in ("model.pt", "config.json")
+            if (out_dir / name).exists()
+        },
+        "note": "export-only augmented quantization artifact; structural fake quant backends are available through quant modules",
+    }
+    write_json(out_dir / "quantization_manifest.json", manifest)
+    _echo({"checkpoint": str(checkpoint), "out": str(out_dir), "manifest": manifest}, json_output)
+
+
+@app.command()
+def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = load_config(config)
+    if backend == "ssh":
+        result = {"backend": "ssh", "commands": ssh_dry_run_commands(cfg).commands}
+    elif backend == "skypilot":
+        result = {"backend": "skypilot", "yaml": skypilot_yaml(cfg)}
+    else:
+        result = {"backend": backend, "status": "local"}
+    _echo(result, json_output)
+
+
+@app.command()
+def worker(host: str = "0.0.0.0", port: int = 7861, teacher_model: str | None = None, json_output: bool = typer.Option(False, "--json")) -> None:
+    if json_output:
+        _echo({"host": host, "port": port, "endpoints": ["/v1/preflight", "/v1/jobs", "/v1/teacher_logits", "/healthz"]}, True)
+        return
+    import uvicorn
+
+    from slimder_man.orchestration.worker_api import create_worker_app
+
+    uvicorn.run(create_worker_app(teacher_model), host=host, port=port)
+
+
+@app.command("consolidate-checkpoint")
+def consolidate_checkpoint(checkpoint: Path, out: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
+    model.save_pretrained(out)
+    _echo({"checkpoint": str(checkpoint), "out": str(out)}, json_output)
+
+
+@app.command("validate-checkpoint")
+def validate_checkpoint(checkpoint: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
+    errors = validate_tiny_model(model)
+    manifest = checkpoint / "compression_manifest.json"
+    if manifest.exists():
+        load_manifest(manifest)
+    _echo({"checkpoint": str(checkpoint), "valid": not errors, "errors": errors}, json_output)
+
+
+if __name__ == "__main__":
+    app()

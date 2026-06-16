@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slimder-man"
+version = "0.1.0"
+description = "Slimder Man: paper-faithful SlimQwen-style MoE compression and distillation tooling"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = {text = "MIT"}
+authors = [{name = "Slimder Man Contributors"}]
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.55",
+  "accelerate>=1.0",
+  "datasets>=2.20",
+  "safetensors>=0.4",
+  "pydantic>=2",
+  "typer>=0.12",
+  "rich>=13",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "numpy",
+  "scipy",
+  "scikit-learn",
+  "pandas",
+  "pyyaml",
+  "orjson",
+  "tqdm",
+  "psutil",
+  "paramiko",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov", "gradio>=4.0"]
+quant = ["optimum"]
+tracking = ["wandb", "mlflow"]
+lm-eval = ["lm-eval"]
+skypilot = ["skypilot"]
+ray = ["ray[train]"]
+deepspeed = ["deepspeed"]
+
+[project.scripts]
+slimder = "slimder_man.cli:app"
+slimqwen = "slimder_man.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "gpu: tests requiring CUDA",
+]
