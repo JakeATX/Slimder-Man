@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -280,15 +281,21 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
 
 
 @app.command()
-def worker(host: str = "0.0.0.0", port: int = 7861, teacher_model: str | None = None, json_output: bool = typer.Option(False, "--json")) -> None:
+def worker(
+    host: str = "0.0.0.0",
+    port: int = 7861,
+    teacher_model: str | None = None,
+    auth_token: str | None = typer.Option(None, "--auth-token", help="Bearer token required for /v1 worker endpoints."),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
     if json_output:
-        _echo({"host": host, "port": port, "endpoints": ["/v1/preflight", "/v1/jobs", "/v1/teacher_logits", "/healthz"]}, True)
+        _echo({"host": host, "port": port, "auth_required": bool(auth_token or os.environ.get("SLIMDER_WORKER_TOKEN")), "endpoints": ["/v1/preflight", "/v1/jobs", "/v1/teacher_logits", "/healthz"]}, True)
         return
     import uvicorn
 
     from slimder_man.orchestration.worker_api import create_worker_app
 
-    uvicorn.run(create_worker_app(teacher_model), host=host, port=port)
+    uvicorn.run(create_worker_app(teacher_model, auth_token=auth_token), host=host, port=port)
 
 
 @app.command("consolidate-checkpoint")
