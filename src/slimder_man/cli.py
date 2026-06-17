@@ -12,6 +12,7 @@ from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.analyze.architecture import describe_model
 from slimder_man.analyze.recommender import recommend
 from slimder_man.analyze.reports import write_analysis_report
+from slimder_man.calibration.artifacts import write_calibration_artifacts
 from slimder_man.calibration.collectors import collect_calibration, collect_tiny_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.compression.apply import compress_model, compress_tiny_model
@@ -154,10 +155,9 @@ def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> 
     out_dir.mkdir(parents=True, exist_ok=True)
     recs = recommend(arch, cfg.compression.preset)
     write_json(out_dir / "architecture.json", arch)
-    write_json(out_dir / "calibration_manifest.json", cal_manifest)
-    write_json(out_dir / "routing_summary.json", {"representation": cal.representation})
+    artifact_manifest = write_calibration_artifacts(out_dir, cfg, cal, cal_manifest, arch)
     write_analysis_report(out_dir / "analysis_report.md", arch, recs)
-    _echo({"architecture": arch, "analysis_dir": str(out_dir), "recommendations": recs}, json_output)
+    _echo({"architecture": arch, "analysis_dir": str(out_dir), "recommendations": recs, "calibration_manifest": artifact_manifest}, json_output)
 
 
 @app.command(name="recommend")
@@ -223,7 +223,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
     cal = collect_tiny_calibration(teacher, batches)
     out_dir = Path(cfg.project.output_dir)
     write_json(out_dir / "analysis" / "architecture.json", arch)
-    write_json(out_dir / "analysis" / "calibration_manifest.json", cal_manifest)
+    write_calibration_artifacts(out_dir / "analysis", cfg, cal, cal_manifest, arch)
     write_analysis_report(out_dir / "analysis" / "analysis_report.md", arch, recommend(arch, cfg.compression.preset))
     student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir / "checkpoints" / "stage_1_compressed")
     train = train_tiny_distill(teacher, student, cfg, out_dir / "training", resume=False)
