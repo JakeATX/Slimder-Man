@@ -20,6 +20,7 @@ class DummyHfMoeConfig:
     num_experts_per_tok: int = 2
     num_shared_experts: int = 2
     tie_word_embeddings: bool = False
+    attention_hidden_size: int | None = None
 
 
 class DummyExpert(nn.Module):
@@ -71,12 +72,13 @@ class DummyHfMoeLayer(nn.Module):
 
 
 class DummyAttention(nn.Module):
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, attention_hidden_size: int | None = None):
         super().__init__()
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        attn_size = attention_hidden_size or hidden_size
+        self.q_proj = nn.Linear(hidden_size, attn_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, attn_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, attn_size, bias=False)
+        self.o_proj = nn.Linear(attn_size, hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.o_proj(self.q_proj(x) + self.k_proj(x) + self.v_proj(x))
@@ -85,7 +87,7 @@ class DummyAttention(nn.Module):
 class DummyHfBlock(nn.Module):
     def __init__(self, config: DummyHfMoeConfig):
         super().__init__()
-        self.self_attn = DummyAttention(config.hidden_size)
+        self.self_attn = DummyAttention(config.hidden_size, config.attention_hidden_size)
         self.mlp = DummyHfMoeLayer(config)
         self.input_layernorm = nn.LayerNorm(config.hidden_size)
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size)
@@ -115,6 +117,8 @@ class DummyHfMoeForCausalLM(nn.Module):
         self.config = config or DummyHfMoeConfig()
         self.model = DummyBackbone(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -132,24 +136,27 @@ class DummyHfMoeForCausalLM(nn.Module):
         return type("DummyCausalLMOutput", (), {"logits": logits, "loss": loss, "mtp_logits": []})()
 
     def save_pretrained(self, output_dir: str | Path, safe_serialization: bool = True) -> None:
-        from safetensors.torch import save_file
+        from safetensors.torch import save_file, save_model
 
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
         if safe_serialization:
-            save_file(self.state_dict(), path / "model.safetensors")
+            save_model(self, str(path / "model.safetensors"))
         else:
             torch.save(self.state_dict(), path / "pytorch_model.bin")
         (path / "config.json").write_text(json.dumps(asdict(self.config), indent=2), encoding="utf-8")
 
     @classmethod
     def from_pretrained(cls, output_dir: str | Path):
-        from safetensors.torch import load_file
+        from safetensors.torch import load_model
 
         path = Path(output_dir)
         model = cls(DummyHfMoeConfig(**json.loads((path / "config.json").read_text(encoding="utf-8"))))
-        state = load_file(path / "model.safetensors") if (path / "model.safetensors").exists() else torch.load(path / "pytorch_model.bin", map_location="cpu")
-        model.load_state_dict(state)
+        if (path / "model.safetensors").exists():
+            load_model(model, str(path / "model.safetensors"))
+        else:
+            state = torch.load(path / "pytorch_model.bin", map_location="cpu")
+            model.load_state_dict(state)
         return model
 
 

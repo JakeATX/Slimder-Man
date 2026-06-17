@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from .base import ArchitectureInfo, MoELayerInfo, count_parameters, dtype_summary
-from .generic_hf_moe import structural_moe_layers
+from .generic_hf_moe import slice_structural_hidden_channels, structural_moe_layers
 
 
 class Qwen3NextAdapter:
@@ -108,40 +108,8 @@ class Qwen3NextAdapter:
     def get_mtp_modules(self, model: nn.Module) -> list[nn.Module]:
         return [m for name, m in model.named_modules() if "mtp" in name.lower()]
 
-    def slice_hidden_channels(self, model: nn.Module, keep_idx):  # pragma: no cover - exercised only with full HF checkpoints
-        keep_idx = keep_idx.detach().cpu().to(torch.long)
-        hidden = int(getattr(getattr(model, "config", None), "hidden_size", keep_idx.numel()))
-        for module in model.modules():
-            if isinstance(module, nn.Embedding) and module.weight.shape[1] == hidden:
-                new_weight = module.weight.detach().index_select(1, keep_idx.to(module.weight.device)).clone()
-                module.embedding_dim = new_weight.shape[1]
-                module.weight = nn.Parameter(new_weight)
-            elif isinstance(module, nn.Linear):
-                weight = module.weight.detach()
-                bias = module.bias.detach() if module.bias is not None else None
-                changed = False
-                if module.out_features == hidden:
-                    weight = weight.index_select(0, keep_idx.to(weight.device))
-                    bias = bias.index_select(0, keep_idx.to(bias.device)) if bias is not None else None
-                    module.out_features = keep_idx.numel()
-                    changed = True
-                if module.in_features == hidden:
-                    weight = weight.index_select(1, keep_idx.to(weight.device))
-                    module.in_features = keep_idx.numel()
-                    changed = True
-                if changed:
-                    module.weight = nn.Parameter(weight.clone())
-                    if bias is not None:
-                        module.bias = nn.Parameter(bias.clone())
-            elif hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 1 and module.weight.shape[0] == hidden:
-                module.weight = nn.Parameter(module.weight.detach().index_select(0, keep_idx.to(module.weight.device)).clone())
-                if getattr(module, "bias", None) is not None and module.bias.shape[0] == hidden:
-                    module.bias = nn.Parameter(module.bias.detach().index_select(0, keep_idx.to(module.bias.device)).clone())
-                if isinstance(module, nn.LayerNorm):
-                    module.normalized_shape = (keep_idx.numel(),)
-        cfg = getattr(model, "config", None)
-        if cfg is not None:
-            cfg.hidden_size = keep_idx.numel()
+    def slice_hidden_channels(self, model: nn.Module, keep_idx):
+        slice_structural_hidden_channels(model, keep_idx)
 
     def drop_blocks(self, model: nn.Module, keep_block_idx: list[int]) -> None:  # pragma: no cover
         base = getattr(model, "model", model)

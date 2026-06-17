@@ -49,8 +49,16 @@ def test_qwen3_next_fixture_compresses_width_depth_and_experts(tmp_path: Path):
     assert student.config.num_experts == 4
     assert student.model.embed_tokens.weight.shape == (config.vocab_size, 24)
     assert student.model.layers[0].input_layernorm.normalized_shape == (24,)
+    assert student.model.layers[0].self_attn.q_proj.in_features == 24
+    assert student.model.layers[0].self_attn.q_proj.out_features == 32
+    assert student.model.layers[0].self_attn.o_proj.in_features == 32
+    assert student.model.layers[0].self_attn.o_proj.out_features == 24
+    assert student.model.layers[0].mlp.gate.in_features == 24
+    assert student.model.layers[0].mlp.experts[0].up_proj.in_features == 24
+    assert student.model.layers[0].mlp.experts[0].down_proj.out_features == 24
     assert len(student.model.layers[0].mlp.experts) == 4
     assert manifest["width"]["hidden_size_after"] == 24
     reloaded = DummyHfMoeForCausalLM.from_pretrained(tmp_path / "qwen")
+    assert reloaded.config.attention_hidden_size == 32
     out = reloaded(input_ids=batches[0][:1])
     assert out.logits.shape[-1] == config.vocab_size

@@ -55,6 +55,120 @@ def _find_router(moe: nn.Module) -> nn.Linear | None:
     return None
 
 
+def _slice_linear(module: nn.Linear, keep_idx: torch.Tensor, *, slice_in: bool, slice_out: bool) -> None:
+    weight = module.weight.detach()
+    bias_param = module.bias
+    bias = bias_param.detach() if bias_param is not None else None
+    index = keep_idx.to(weight.device)
+    if slice_out:
+        weight = weight.index_select(0, index)
+        bias = bias.index_select(0, index.to(bias.device)) if bias is not None else None
+        module.out_features = keep_idx.numel()
+    if slice_in:
+        weight = weight.index_select(1, index)
+        module.in_features = keep_idx.numel()
+    module.weight = nn.Parameter(weight.clone(), requires_grad=module.weight.requires_grad)
+    if bias is not None and bias_param is not None:
+        module.bias = nn.Parameter(bias.clone(), requires_grad=bias_param.requires_grad)
+
+
+def _slice_norm(module: nn.Module, keep_idx: torch.Tensor) -> None:
+    device_idx = keep_idx.to(module.weight.device)
+    module.weight = nn.Parameter(module.weight.detach().index_select(0, device_idx).clone(), requires_grad=module.weight.requires_grad)
+    if getattr(module, "bias", None) is not None:
+        module.bias = nn.Parameter(
+            module.bias.detach().index_select(0, keep_idx.to(module.bias.device)).clone(),
+            requires_grad=module.bias.requires_grad,
+        )
+    if isinstance(module, nn.LayerNorm):
+        module.normalized_shape = (keep_idx.numel(),)
+
+
+def _linear_slice_rule(name: str, module: nn.Linear, hidden: int, *, is_router: bool = False) -> tuple[bool, bool] | None:
+    leaf = name.rsplit(".", 1)[-1].lower()
+    lowered = name.lower()
+    is_attention = any(part in lowered for part in ("attn", "attention", "self_attn"))
+    is_expert_context = any(part in lowered for part in (".experts.", ".shared_experts.", ".expert.", ".shared_expert."))
+
+    if leaf == "lm_head":
+        return module.in_features == hidden, False
+    if leaf in {"q_proj", "k_proj", "v_proj", "query", "key", "value"} and is_attention:
+        return module.in_features == hidden, False
+    if leaf in {"o_proj", "out_proj"} and is_attention:
+        return False, module.out_features == hidden
+    if leaf in {"up_proj", "w1", "w3"} and is_expert_context and module.out_features != hidden:
+        return module.in_features == hidden, False
+    if leaf == "gate_proj" and is_expert_context and module.out_features != hidden:
+        return module.in_features == hidden, False
+    if leaf in {"down_proj", "w2"} and is_expert_context:
+        return False, module.out_features == hidden
+    if leaf in {"router", "gate", "gate_proj"} and is_router and module.out_features != hidden:
+        return module.in_features == hidden, False
+    return None
+
+
+def slice_structural_hidden_channels(model: nn.Module, keep_idx: torch.Tensor, hidden: int | None = None) -> None:
+    """Slice hidden channels using named structural roles instead of all Linear shapes."""
+    keep_idx = keep_idx.detach().cpu().to(torch.long)
+    cfg = getattr(model, "config", None)
+    old_hidden = int(hidden or getattr(cfg, "hidden_size", keep_idx.numel()))
+    named = list(model.named_modules())
+    embedding_heads: list[tuple[nn.Embedding, nn.Linear]] = []
+    preserves_attention_width = False
+    router_ids = {id(router) for moe in structural_moe_layers(model) if (router := _find_router(moe)) is not None}
+    for _, embedding in named:
+        if not isinstance(embedding, nn.Embedding) or embedding.weight.shape[1] != old_hidden:
+            continue
+        for _, head in named:
+            if isinstance(head, nn.Linear) and head.weight is embedding.weight:
+                embedding_heads.append((embedding, head))
+
+    unsupported: list[str] = []
+    for name, module in named:
+        if isinstance(module, nn.Embedding) and module.weight.shape[1] == old_hidden:
+            module.weight = nn.Parameter(
+                module.weight.detach().index_select(1, keep_idx.to(module.weight.device)).clone(),
+                requires_grad=module.weight.requires_grad,
+            )
+            module.embedding_dim = keep_idx.numel()
+            continue
+        if isinstance(module, nn.Linear):
+            rule = _linear_slice_rule(name, module, old_hidden, is_router=id(module) in router_ids)
+            if rule is None:
+                if module.in_features == old_hidden or module.out_features == old_hidden:
+                    unsupported.append(name or module.__class__.__name__)
+                continue
+            slice_in, slice_out = rule
+            leaf = name.rsplit(".", 1)[-1].lower()
+            if leaf in {"q_proj", "k_proj", "v_proj", "query", "key", "value"} and module.out_features == old_hidden:
+                preserves_attention_width = True
+            if leaf in {"o_proj", "out_proj"} and module.in_features == old_hidden:
+                preserves_attention_width = True
+            if slice_in or slice_out:
+                _slice_linear(module, keep_idx, slice_in=slice_in, slice_out=slice_out)
+            continue
+        if (
+            hasattr(module, "weight")
+            and getattr(module.weight, "ndim", 0) == 1
+            and module.weight.shape[0] == old_hidden
+        ):
+            _slice_norm(module, keep_idx)
+
+    if unsupported:
+        names = ", ".join(unsupported[:8])
+        suffix = "" if len(unsupported) <= 8 else f", ... ({len(unsupported)} total)"
+        raise ValueError(f"Unsupported hidden-size Linear modules for structural slicing: {names}{suffix}")
+
+    for embedding, head in embedding_heads:
+        head.weight = embedding.weight
+        head.in_features = keep_idx.numel()
+
+    if cfg is not None:
+        cfg.hidden_size = keep_idx.numel()
+        if preserves_attention_width and hasattr(cfg, "attention_hidden_size"):
+            cfg.attention_hidden_size = old_hidden
+
+
 def is_structural_moe_layer(module: nn.Module) -> bool:
     experts = _expert_container(module)
     if experts is None or len(experts) == 0:
@@ -178,7 +292,7 @@ class GenericHfMoeAdapter:
         return [module for name, module in model.named_modules() if "mtp" in name.lower()]
 
     def slice_hidden_channels(self, model: nn.Module, keep_idx: torch.Tensor) -> None:
-        raise NotImplementedError("Generic HF MoE structural adapter supports introspection only")
+        slice_structural_hidden_channels(model, keep_idx)
 
     def drop_blocks(self, model: nn.Module, keep_block_idx: list[int]) -> None:
         for base in self._candidate_bases(model):
@@ -225,7 +339,7 @@ class GenericHfMoeAdapter:
         if manifest["width"]["hidden_size_after"] != getattr(cfg, "hidden_size", manifest["width"]["hidden_size_after"]):
             cfg.hidden_size = manifest["width"]["hidden_size_after"]
 
-    def save_pretrained(self, model: nn.Module, output_dir: str, manifest: dict | None = None) -> None:  # pragma: no cover
+    def save_pretrained(self, model: nn.Module, output_dir: str, manifest: dict | None = None) -> None:
         if not hasattr(model, "save_pretrained"):
             raise NotImplementedError("Model does not expose save_pretrained")
         model.save_pretrained(output_dir)
