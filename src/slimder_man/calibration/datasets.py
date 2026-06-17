@@ -77,7 +77,7 @@ def sample_calibration_tokens(cfg: CalibrationConfig, vocab_size: int = 128, tok
     elif cfg.dataset.type == "tokenized":
         path = Path(cfg.dataset.path or "")
         if path.suffix in {".pt", ".pth"}:
-            data = torch.load(path, map_location="cpu")
+            data = torch.load(path, map_location="cpu", weights_only=True)
         else:
             data = json.loads(path.read_text(encoding="utf-8"))
         tensor = torch.as_tensor(data, dtype=torch.long).reshape(-1)

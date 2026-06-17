@@ -141,7 +141,7 @@ class DummyHfMoeForCausalLM(nn.Module):
         return type("DummyCausalLMOutput", (), {"logits": logits, "loss": loss, "mtp_logits": []})()
 
     def save_pretrained(self, output_dir: str | Path, safe_serialization: bool = True) -> None:
-        from safetensors.torch import save_file, save_model
+        from safetensors.torch import save_model
 
         path = Path(output_dir)
         path.mkdir(parents=True, exist_ok=True)
@@ -160,7 +160,7 @@ class DummyHfMoeForCausalLM(nn.Module):
         if (path / "model.safetensors").exists():
             load_model(model, str(path / "model.safetensors"))
         else:
-            state = torch.load(path / "pytorch_model.bin", map_location="cpu")
+            state = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
             model.load_state_dict(state)
         return model
 
