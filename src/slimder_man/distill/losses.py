@@ -7,11 +7,13 @@ from .mtp import align_mtp_logits, align_teacher_logits_for_mtp, mtp_labels
 
 
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
     s = student_logits[:, :-1, :] / temperature
     t = teacher_logits[:, :-1, :] / temperature
     q = torch.softmax(t, dim=-1)
     log_p = torch.log_softmax(s, dim=-1)
-    return -(q * log_p).sum(dim=-1).mean()
+    return -(q * log_p).sum(dim=-1).mean() * (temperature**2)
 
 
 def lm_loss(student_logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
@@ -19,6 +21,8 @@ def lm_loss(student_logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tens
 
 
 def mtp_losses(student_mtp_logits: list[torch.Tensor], teacher_logits: torch.Tensor, input_ids: torch.Tensor, temperature: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
     lm_terms = []
     kd_terms = []
     for i, logits in enumerate(student_mtp_logits, start=1):
@@ -30,7 +34,7 @@ def mtp_losses(student_mtp_logits: list[torch.Tensor], teacher_logits: torch.Ten
         teacher_aligned = align_teacher_logits_for_mtp(teacher_logits, i)
         q = torch.softmax(teacher_aligned / temperature, dim=-1)
         log_p = torch.log_softmax(aligned / temperature, dim=-1)
-        kd_terms.append(-(q * log_p).sum(dim=-1).mean())
+        kd_terms.append(-(q * log_p).sum(dim=-1).mean() * (temperature**2))
     zero = teacher_logits.sum() * 0
     return (torch.stack(lm_terms).mean() if lm_terms else zero, torch.stack(kd_terms).mean() if kd_terms else zero)
 
