@@ -114,18 +114,23 @@ class DummyBackbone(nn.Module):
 class DummyHfMoeForCausalLM(nn.Module):
     def __init__(self, config: DummyHfMoeConfig | None = None):
         super().__init__()
-        self.config = config or DummyHfMoeConfig()
-        self.model = DummyBackbone(self.config)
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
-        self._init_weights()
+        rng_state = torch.get_rng_state()
+        try:
+            self.config = config or DummyHfMoeConfig()
+            self.model = DummyBackbone(self.config)
+            self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+            if self.config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+            self._init_weights()
+        finally:
+            torch.set_rng_state(rng_state)
 
     def _init_weights(self) -> None:
-        torch.manual_seed(2026)
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Embedding)):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        generator = torch.Generator(device="cpu").manual_seed(2026)
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, (nn.Linear, nn.Embedding)):
+                    module.weight.normal_(mean=0.0, std=0.02, generator=generator)
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> object:
         hidden = self.model(input_ids)

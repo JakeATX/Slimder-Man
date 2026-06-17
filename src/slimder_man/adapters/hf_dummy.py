@@ -112,12 +112,16 @@ class DummyBackbone(nn.Module):
 class DummyHfMoeForCausalLM(nn.Module):
     def __init__(self, config: DummyHfMoeConfig | None = None):
         super().__init__()
-        self.config = config or DummyHfMoeConfig()
-        self.model = DummyBackbone(self.config)
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
-        self._init_weights()
+        rng_state = torch.get_rng_state()
+        try:
+            self.config = config or DummyHfMoeConfig()
+            self.model = DummyBackbone(self.config)
+            self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+            if self.config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+            self._init_weights()
+        finally:
+            torch.set_rng_state(rng_state)
 
     def _init_weights(self) -> None:
         generator = torch.Generator(device="cpu").manual_seed(2026)
