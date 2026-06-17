@@ -36,6 +36,8 @@ class ManifestExpertLayer(StrictModel):
     score_vector: list[float] = Field(default_factory=list)
     importance_metric_used: str | None = None
     similarity_metric_used: str | None = None
+    score_artifact: dict | None = None
+    similarity_artifact: dict | None = None
 
     @model_validator(mode="after")
     def all_sets_valid(self) -> "ManifestExpertLayer":
@@ -68,6 +70,23 @@ class ManifestTokenizer(StrictModel):
     artifact_hashes: dict[str, str] = Field(default_factory=dict)
 
 
+class ManifestProvenance(StrictModel):
+    normalized_config_sha256: str
+    source_config_path: str | None = None
+    source_config_sha256: str | None = None
+    git_commit: str | None = None
+    package_version: str
+
+
+class ManifestCalibrationArtifacts(StrictModel):
+    manifest_path: str
+    manifest_sha256: str
+    analysis_dir: str
+    artifacts: dict[str, dict]
+    calibration: dict | None = None
+    reap_convention: str | None = None
+
+
 class CompressionManifest(StrictModel):
     schema_version: str = "1.0"
     paper_faithful: bool
@@ -75,6 +94,10 @@ class CompressionManifest(StrictModel):
     teacher_revision: str | None = None
     student_output_format: str | None = None
     seed: int
+    provenance: ManifestProvenance | None = None
+    calibration_artifacts: ManifestCalibrationArtifacts | None = None
+    progressive: dict = Field(default_factory=dict)
+    stage_provenance: dict = Field(default_factory=dict)
     calibration: dict
     target: ManifestTarget
     depth: ManifestDepth

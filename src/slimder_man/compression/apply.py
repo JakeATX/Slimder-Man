@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
+from slimder_man.calibration.artifacts import SIMILARITY_ATTRS
 from slimder_man.adapters.registry import get_adapter
 from slimder_man.adapters.tiny import TinyAdapter, TinyMoEForCausalLM, clone_tiny_model
 from slimder_man.calibration.collectors import CalibrationResult, hidden_keep_indices
@@ -17,6 +18,8 @@ from slimder_man.compression.router import router_rows_for_merge
 from slimder_man.compression.validate import validate_tiny_model
 from slimder_man.config.schema import SlimderConfig
 from slimder_man.utils.hashing import sha256_file
+from slimder_man.utils.json import read_json
+from slimder_man.utils.provenance import config_provenance
 
 
 MODEL_ARTIFACT_NAMES = {"config.json", "generation_config.json", "model.safetensors", "pytorch_model.bin"}
@@ -145,6 +148,61 @@ def _save_tokenizer_artifacts(tokenizer, output_dir: Path) -> dict[str, str]:
     return hashes
 
 
+def _calibration_manifest_reference(path: str | Path | None) -> dict | None:
+    if path is None:
+        return None
+    manifest_path = Path(path)
+    if not manifest_path.exists():
+        raise ValueError(f"Calibration manifest not found: {manifest_path}")
+    manifest_path = manifest_path.resolve()
+    manifest = read_json(manifest_path)
+    analysis_dir = manifest_path.parent
+    artifacts = manifest.get("artifacts", {})
+    verified: dict[str, dict] = {}
+    for name, artifact in artifacts.items():
+        artifact_path = analysis_dir / artifact["path"]
+        if not artifact_path.exists():
+            raise ValueError(f"Calibration artifact missing: {artifact_path}")
+        digest = sha256_file(artifact_path)
+        if digest != artifact.get("sha256"):
+            raise ValueError(f"Calibration artifact hash mismatch: {artifact_path}")
+        verified[name] = {
+            "path": str(artifact_path.resolve()),
+            "kind": artifact.get("kind"),
+            "sha256": digest,
+        }
+    return {
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": sha256_file(manifest_path),
+        "analysis_dir": str(analysis_dir.resolve()),
+        "artifacts": verified,
+        "calibration": manifest.get("calibration"),
+        "reap_convention": manifest.get("experts", {}).get("reap_convention"),
+    }
+
+
+def _layer_calibration_references(calibration_ref: dict | None, layer_idx: int, importance_metric: str, similarity_metric: str) -> dict:
+    if calibration_ref is None:
+        return {}
+    artifacts = calibration_ref.get("artifacts", {})
+    score_name = f"expert_stats_layer_{layer_idx}.safetensors"
+    refs: dict[str, dict] = {}
+    if score_name in artifacts:
+        refs["score_artifact"] = {
+            **artifacts[score_name],
+            "tensor": importance_metric,
+        }
+    if similarity_metric in SIMILARITY_ATTRS:
+        sim_name = f"expert_similarity_layer_{layer_idx}_{similarity_metric}.safetensors"
+        if sim_name in artifacts:
+            refs["similarity_artifact"] = {
+                **artifacts[sim_name],
+                "tensor": "similarity",
+                "metric": similarity_metric,
+            }
+    return refs
+
+
 def _resolve_expert_importance(calibration: CalibrationResult, metric: str, layer_idx: int) -> torch.Tensor:
     metrics = {
         "frequency": calibration.expert_frequency,
@@ -191,10 +249,19 @@ def _select_or_merge_experts(experts: list[torch.nn.Module], scores: torch.Tenso
     return merge_experts(experts, scores, sim, target_experts)
 
 
-def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibration: CalibrationResult, output_dir: str | Path | None = None) -> tuple[TinyMoEForCausalLM, dict]:
+def compress_tiny_model(
+    model: TinyMoEForCausalLM,
+    cfg: SlimderConfig,
+    calibration: CalibrationResult,
+    output_dir: str | Path | None = None,
+    calibration_manifest_path: str | Path | None = None,
+    source_config_path: str | Path | None = None,
+    stage_provenance: dict | None = None,
+) -> tuple[TinyMoEForCausalLM, dict]:
     student = clone_tiny_model(model)
     adapter = TinyAdapter()
     target = cfg.compression.target
+    calibration_ref = _calibration_manifest_reference(calibration_manifest_path)
     remove_last_n_layers = resolve_remove_last_n(len(student.layers), target.remove_last_n_layers, target.depth_remove_fraction)
     keep_blocks = compute_depth_keep_indices(len(student.layers), remove_last_n_layers)
     adapter.drop_blocks(student, keep_blocks)
@@ -221,6 +288,12 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
                 "score_vector": [float(x) for x in scores.detach().cpu().tolist()],
                 "importance_metric_used": cfg.compression.experts.importance_metric,
                 "similarity_metric_used": cfg.compression.experts.similarity_metric,
+                **_layer_calibration_references(
+                    calibration_ref,
+                    original_layer_idx,
+                    cfg.compression.experts.importance_metric,
+                    cfg.compression.experts.similarity_metric,
+                ),
             }
         )
     manifest = {
@@ -230,6 +303,10 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
         "teacher_revision": cfg.teacher.revision,
         "student_output_format": "torch",
         "seed": cfg.project.seed,
+        "provenance": config_provenance(cfg, source_config_path),
+        "calibration_artifacts": calibration_ref,
+        "progressive": cfg.progressive.model_dump(mode="json"),
+        "stage_provenance": stage_provenance or {},
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
         "target": {
             "hidden_size": target.hidden_size,
@@ -270,13 +347,32 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
     return student, manifest
 
 
-def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, adapter=None, output_dir: str | Path | None = None, tokenizer=None):
+def compress_model(
+    model,
+    cfg: SlimderConfig,
+    calibration: CalibrationResult,
+    adapter=None,
+    output_dir: str | Path | None = None,
+    tokenizer=None,
+    calibration_manifest_path: str | Path | None = None,
+    source_config_path: str | Path | None = None,
+    stage_provenance: dict | None = None,
+):
     if isinstance(model, TinyMoEForCausalLM):
-        return compress_tiny_model(model, cfg, calibration, output_dir)
+        return compress_tiny_model(
+            model,
+            cfg,
+            calibration,
+            output_dir,
+            calibration_manifest_path=calibration_manifest_path,
+            source_config_path=source_config_path,
+            stage_provenance=stage_provenance,
+        )
 
     student = deepcopy(model)
     adapter = adapter or get_adapter(student)
     target = cfg.compression.target
+    calibration_ref = _calibration_manifest_reference(calibration_manifest_path)
     source_layers = len(adapter.iter_transformer_blocks(student))
     remove_last_n_layers = resolve_remove_last_n(source_layers, target.remove_last_n_layers, target.depth_remove_fraction)
     keep_blocks = compute_depth_keep_indices(source_layers, remove_last_n_layers)
@@ -310,6 +406,12 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
                 "score_vector": [float(x) for x in scores.detach().cpu().tolist()],
                 "importance_metric_used": cfg.compression.experts.importance_metric,
                 "similarity_metric_used": cfg.compression.experts.similarity_metric,
+                **_layer_calibration_references(
+                    calibration_ref,
+                    original_layer_idx,
+                    cfg.compression.experts.importance_metric,
+                    cfg.compression.experts.similarity_metric,
+                ),
             }
         )
 
@@ -321,6 +423,10 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
         "teacher_revision": cfg.teacher.revision,
         "student_output_format": cfg.student.output_format,
         "seed": cfg.project.seed,
+        "provenance": config_provenance(cfg, source_config_path),
+        "calibration_artifacts": calibration_ref,
+        "progressive": cfg.progressive.model_dump(mode="json"),
+        "stage_provenance": stage_provenance or {},
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
         "target": {"hidden_size": target.hidden_size, "remove_last_n_layers": remove_last_n_layers, "routed_experts": target.routed_experts, "top_k": target.routed_top_k},
         "depth": {"method": "last_layers", "kept_block_indices": keep_blocks},

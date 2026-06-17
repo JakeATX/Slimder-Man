@@ -27,6 +27,30 @@ def _encode_text(text: str, vocab_size: int, tokenizer: object | None = None) ->
     return [int(token) % vocab_size for token in ids]
 
 
+def _tokenizer_fingerprint(tokenizer: object | None, vocab_size: int) -> dict | None:
+    if tokenizer is None:
+        return None
+    probes = ["Slimder Man calibration probe", "alpha beta gamma", ""]
+    encoded = [_encode_text(probe, vocab_size, tokenizer)[:32] for probe in probes]
+    payload = {
+        "class": tokenizer.__class__.__name__,
+        "module": tokenizer.__class__.__module__,
+        "name_or_path": getattr(tokenizer, "name_or_path", None),
+        "vocab_size": getattr(tokenizer, "vocab_size", None),
+        "init_kwargs": getattr(tokenizer, "init_kwargs", None),
+        "probe_encodings": encoded,
+    }
+    canonical = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return {
+        "class": payload["class"],
+        "module": payload["module"],
+        "name_or_path": payload["name_or_path"],
+        "vocab_size": payload["vocab_size"],
+        "fingerprint_sha256": hashlib.sha256(canonical).hexdigest(),
+        "probe_sample_hash": hashlib.sha256(json.dumps(encoded, sort_keys=True).encode("utf-8")).hexdigest(),
+    }
+
+
 def sample_calibration_tokens(cfg: CalibrationConfig, vocab_size: int = 128, tokenizer: object | None = None) -> tuple[list[torch.Tensor], dict]:
     source: dict[str, object] = {"type": cfg.dataset.type}
     if cfg.dataset.type == "synthetic":
@@ -107,4 +131,5 @@ def sample_calibration_tokens(cfg: CalibrationConfig, vocab_size: int = 128, tok
         "sample_hashes": sample_hashes,
         "source": source,
         "tokenizer": tokenizer.__class__.__name__ if tokenizer is not None else None,
+        "tokenizer_fingerprint": _tokenizer_fingerprint(tokenizer, vocab_size),
     }

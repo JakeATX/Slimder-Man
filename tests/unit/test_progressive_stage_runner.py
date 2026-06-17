@@ -1,9 +1,13 @@
+from pathlib import Path
+
 import torch
 
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.calibration.collectors import CalibrationResult
+from slimder_man.compression.manifests import load_manifest
 from slimder_man.config.schema import SlimderConfig
 from slimder_man.distill.stage_runner import run_tiny_progressive_stages
+from slimder_man.utils.hashing import sha256_file
 
 
 def _calibration() -> CalibrationResult:
@@ -71,5 +75,13 @@ def test_progressive_stage_runner_executes_real_tiny_stages(tmp_path):
     assert len(result["stages"]) == 2
     assert (tmp_path / "real_progressive" / "stage_1" / "compressed" / "compression_manifest.json").exists()
     assert (tmp_path / "real_progressive" / "stage_2" / "compressed" / "compression_manifest.json").exists()
+    stage_1_manifest = load_manifest(tmp_path / "real_progressive" / "stage_1" / "compressed" / "compression_manifest.json")
+    stage_2_manifest = load_manifest(tmp_path / "real_progressive" / "stage_2" / "compressed" / "compression_manifest.json")
+    assert stage_1_manifest["calibration_artifacts"]["manifest_sha256"] == sha256_file(stage_1_manifest["calibration_artifacts"]["manifest_path"])
+    assert stage_2_manifest["calibration_artifacts"]["manifest_sha256"] == sha256_file(stage_2_manifest["calibration_artifacts"]["manifest_path"])
+    assert stage_1_manifest["experts"]["layers"][0]["score_artifact"]["tensor"] == "soft_logits"
+    assert stage_2_manifest["experts"]["layers"][0]["similarity_artifact"]["metric"] == "router_weights"
+    assert stage_1_manifest["stage_provenance"]["stage"] == 1
+    assert Path(stage_2_manifest["stage_provenance"]["previous_checkpoint"]).parts[-2:] == ("stage_1", "compressed")
     assert (tmp_path / "real_progressive" / "stage_2" / "training" / "training_report.md").exists()
     assert result["stages"][1]["training"]["global_step"] == 1

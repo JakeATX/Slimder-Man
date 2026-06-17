@@ -67,13 +67,31 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
     calibration = collect_calibration(teacher, batches, adapter)
     calibration.hidden_scores = torch.arange(teacher.config.hidden_size, dtype=torch.float32)
+    analysis_dir = tmp_path / "analysis"
+    from slimder_man.calibration.artifacts import write_calibration_artifacts
+
+    write_calibration_artifacts(
+        analysis_dir,
+        cfg,
+        calibration,
+        {"type": "synthetic", "sample_hashes": ["fixture"], "dataset_hash": "0" * 64},
+        {"model_type": "dummy_hf_moe"},
+    )
     depth_expert_cfg = cfg.model_copy(
         deep=True,
         update={"compression": cfg.compression.model_copy(update={"target": cfg.compression.target.model_copy(update={"hidden_size": 32})})},
     )
     depth_expert_student, _ = compress_model(teacher, depth_expert_cfg, calibration, adapter=adapter)
 
-    student, manifest = compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "ckpt", tokenizer=DummyTokenizer())
+    student, manifest = compress_model(
+        teacher,
+        cfg,
+        calibration,
+        adapter=adapter,
+        output_dir=tmp_path / "ckpt",
+        tokenizer=DummyTokenizer(),
+        calibration_manifest_path=analysis_dir / "calibration_manifest.json",
+    )
 
     assert len(student.model.layers) == 2
     assert len(student.model.layers[0].mlp.experts) == 4
@@ -99,10 +117,21 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     assert manifest["width"]["hidden_size_after"] == 24
     assert manifest["width"]["hidden_keep_indices"] == list(range(8, 32))
     assert manifest["param_counts"]["after"] < sum(p.numel() for p in depth_expert_student.parameters())
+    assert manifest["provenance"]["normalized_config_sha256"]
+    assert manifest["provenance"]["package_version"]
+    assert manifest["progressive"]["stages"] == cfg.progressive.stages
+    assert manifest["calibration_artifacts"]["manifest_sha256"] == sha256_file(analysis_dir / "calibration_manifest.json")
+    assert manifest["calibration_artifacts"]["calibration"]["sample_hashes"] == ["fixture"]
+    first_layer = manifest["experts"]["layers"][0]
+    assert Path(first_layer["score_artifact"]["path"]).exists()
+    assert first_layer["score_artifact"]["tensor"] == "soft_logits"
+    assert Path(first_layer["similarity_artifact"]["path"]).exists()
+    assert first_layer["similarity_artifact"]["metric"] == "router_weights"
     assert (tmp_path / "ckpt" / "model.safetensors").exists()
     assert (tmp_path / "ckpt" / "tokenizer_config.json").exists()
     loaded_manifest = load_manifest(tmp_path / "ckpt" / "compression_manifest.json")
     assert loaded_manifest["student_output_format"] == "hf_safetensors"
+    assert loaded_manifest["calibration_artifacts"]["manifest_sha256"] == sha256_file(analysis_dir / "calibration_manifest.json")
     assert loaded_manifest["experts"]["layers"][0]["importance_metric_used"] == "soft_logits"
     assert loaded_manifest["experts"]["layers"][0]["score_vector"]
     assert loaded_manifest["width"]["hidden_keep_indices"] == list(range(8, 32))

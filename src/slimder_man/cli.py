@@ -32,7 +32,7 @@ from slimder_man.orchestration.ssh import ssh_dry_run_commands
 from slimder_man.quant.fake_backend import fake_quantize_tiny_model
 from slimder_man.ui.app import create_app
 from slimder_man.utils.hashing import sha256_file
-from slimder_man.utils.json import write_json
+from slimder_man.utils.json import read_json, write_json
 from slimder_man.utils.determinism import set_seed
 
 app = typer.Typer(no_args_is_help=True)
@@ -195,6 +195,57 @@ def _copy_checkpoint_sidecars(source: Path, out: Path) -> dict[str, str]:
     return copied
 
 
+def _copy_and_rewrite_calibration_references(out: Path) -> dict[str, str]:
+    manifest_path = out / "compression_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    manifest = read_json(manifest_path)
+    calibration = manifest.get("calibration_artifacts")
+    if not calibration:
+        return {}
+    target_dir = out / "calibration_artifacts"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied: dict[str, str] = {}
+    source_manifest = Path(calibration["manifest_path"])
+    if not source_manifest.exists():
+        raise ValueError(f"Cannot consolidate missing calibration manifest: {source_manifest}")
+    target_manifest = target_dir / "calibration_manifest.json"
+    shutil.copy2(source_manifest, target_manifest)
+    calibration["manifest_path"] = str(target_manifest.resolve())
+    calibration["manifest_sha256"] = sha256_file(target_manifest)
+    calibration["analysis_dir"] = str(target_dir.resolve())
+    copied[target_manifest.relative_to(out).as_posix()] = sha256_file(target_manifest)
+
+    rewritten_by_name: dict[str, dict] = {}
+    for name, artifact in calibration.get("artifacts", {}).items():
+        source_artifact = Path(artifact["path"])
+        if not source_artifact.exists():
+            raise ValueError(f"Cannot consolidate missing calibration artifact: {source_artifact}")
+        target_artifact = target_dir / name
+        shutil.copy2(source_artifact, target_artifact)
+        rewritten = {
+            **artifact,
+            "path": str(target_artifact.resolve()),
+            "sha256": sha256_file(target_artifact),
+        }
+        rewritten_by_name[name] = rewritten
+        copied[target_artifact.relative_to(out).as_posix()] = rewritten["sha256"]
+    calibration["artifacts"] = rewritten_by_name
+
+    for layer in manifest.get("experts", {}).get("layers", []):
+        for key in ("score_artifact", "similarity_artifact"):
+            artifact = layer.get(key)
+            if not artifact:
+                continue
+            name = Path(artifact["path"]).name
+            if name in rewritten_by_name:
+                layer[key] = {**artifact, **rewritten_by_name[name]}
+    manifest["calibration_artifacts"] = calibration
+    write_json(manifest_path, manifest)
+    copied["compression_manifest.json"] = sha256_file(manifest_path)
+    return copied
+
+
 def _forward_validation_errors(model, kind: str) -> list[str]:
     errors: list[str] = []
     try:
@@ -221,6 +272,26 @@ def _forward_validation_errors(model, kind: str) -> list[str]:
                 break
     except Exception as exc:
         errors.append(str(exc))
+    return errors
+
+
+def _calibration_artifact_validation_errors(manifest_data: dict | None) -> list[str]:
+    if not manifest_data or not manifest_data.get("calibration_artifacts"):
+        return []
+    errors: list[str] = []
+    calibration = manifest_data["calibration_artifacts"]
+    manifest_path = Path(calibration["manifest_path"])
+    if not manifest_path.exists():
+        errors.append(f"calibration manifest missing: {manifest_path}")
+    elif sha256_file(manifest_path) != calibration["manifest_sha256"]:
+        errors.append(f"calibration manifest hash mismatch: {manifest_path}")
+    for artifact in calibration.get("artifacts", {}).values():
+        path = Path(artifact["path"])
+        if not path.exists():
+            errors.append(f"calibration artifact missing: {path}")
+            continue
+        if sha256_file(path) != artifact.get("sha256"):
+            errors.append(f"calibration artifact hash mismatch: {path}")
     return errors
 
 
@@ -315,20 +386,45 @@ def compress(
     stage: int = 1,
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    cfg = _load_cli_config(_resolve_config_path(config, config_option))
+    config_path = _resolve_config_path(config, config_option)
+    cfg = _load_cli_config(config_path)
     set_seed(cfg.project.seed)
     out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     teacher = _load_model(cfg)
     arch = describe_model(teacher)
     tokenizer = _load_tokenizer(cfg)
-    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+    batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+    analysis_dir = Path(cfg.project.output_dir) / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    recs = recommend(arch, cfg.compression.preset)
+    write_json(analysis_dir / "architecture.json", arch)
     if cfg.teacher.load_mode == "tiny":
         cal = collect_tiny_calibration(teacher, batches)
-        student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir)
+        write_calibration_artifacts(analysis_dir, cfg, cal, cal_manifest, arch)
+        write_analysis_report(analysis_dir / "analysis_report.md", arch, recs)
+        student, manifest = compress_tiny_model(
+            teacher,
+            cfg,
+            cal,
+            out_dir,
+            calibration_manifest_path=analysis_dir / "calibration_manifest.json",
+            source_config_path=config_path,
+        )
     else:
         adapter = get_adapter(teacher)
         cal = collect_calibration(teacher, batches, adapter)
-        student, manifest = compress_model(teacher, cfg, cal, adapter=adapter, output_dir=out_dir, tokenizer=tokenizer)
+        write_calibration_artifacts(analysis_dir, cfg, cal, cal_manifest, arch)
+        write_analysis_report(analysis_dir / "analysis_report.md", arch, recs)
+        student, manifest = compress_model(
+            teacher,
+            cfg,
+            cal,
+            adapter=adapter,
+            output_dir=out_dir,
+            tokenizer=tokenizer,
+            calibration_manifest_path=analysis_dir / "calibration_manifest.json",
+            source_config_path=config_path,
+        )
     _echo({"checkpoint": str(out_dir), "manifest": manifest, "params": sum(p.numel() for p in student.parameters())}, json_output)
 
 
@@ -384,7 +480,16 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
         calibration_manifest = write_calibration_artifacts(analysis_dir, cfg, cal, cal_manifest, arch)
         write_analysis_report(analysis_dir / "analysis_report.md", arch, recs)
         ckpt_dir = out_dir / "checkpoints" / "stage_1_compressed"
-        student, manifest = compress_model(teacher, cfg, cal, adapter=adapter, output_dir=ckpt_dir, tokenizer=tokenizer)
+        student, manifest = compress_model(
+            teacher,
+            cfg,
+            cal,
+            adapter=adapter,
+            output_dir=ckpt_dir,
+            tokenizer=tokenizer,
+            calibration_manifest_path=analysis_dir / "calibration_manifest.json",
+            source_config_path=config,
+        )
         train = train_causal_lm_distill(teacher, student, cfg, out_dir / "training", batches, resume=False)
         eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
         ppl = causal_lm_perplexity(student, eval_batches[:8])
@@ -409,7 +514,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
     write_calibration_artifacts(out_dir / "analysis", cfg, cal, cal_manifest, arch)
     write_analysis_report(out_dir / "analysis" / "analysis_report.md", arch, recommend(arch, cfg.compression.preset))
     if cfg.progressive.stages > 1 or cfg.progressive.schedule != "one_stage":
-        progressive = run_tiny_progressive_stages(teacher, cfg, out_dir / "progressive")
+        progressive = run_tiny_progressive_stages(teacher, cfg, out_dir / "progressive", source_config_path=config)
         final_train = Path(progressive["final_training_checkpoint"])
         student = TinyMoEForCausalLM.from_pretrained(final_train)
         eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
@@ -424,7 +529,14 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
         write_json(out_dir / "run_summary.json", result)
         _echo(result, json_output)
         return
-    student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir / "checkpoints" / "stage_1_compressed")
+    student, manifest = compress_tiny_model(
+        teacher,
+        cfg,
+        cal,
+        out_dir / "checkpoints" / "stage_1_compressed",
+        calibration_manifest_path=out_dir / "analysis" / "calibration_manifest.json",
+        source_config_path=config,
+    )
     train = train_tiny_distill(teacher, student, cfg, out_dir / "training", resume=False)
     eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
     ppl = tiny_perplexity(student, eval_batches[:8])
@@ -531,6 +643,7 @@ def consolidate_checkpoint(
     model, kind = _load_checkpoint_auto(checkpoint)
     _save_checkpoint_auto(model, out)
     sidecar_hashes = _copy_checkpoint_sidecars(checkpoint, out)
+    sidecar_hashes.update(_copy_and_rewrite_calibration_references(out))
     artifact_hashes = {
         path.relative_to(out).as_posix(): sha256_file(path)
         for path in out.rglob("*")
@@ -555,6 +668,7 @@ def validate_checkpoint(
     if manifest.exists():
         try:
             manifest_data = load_manifest(manifest)
+            errors.extend(_calibration_artifact_validation_errors(manifest_data))
         except Exception as exc:
             errors.append(f"compression manifest invalid: {exc}")
     _echo({"checkpoint": str(checkpoint), "kind": kind, "valid": not errors, "errors": errors, "manifest": manifest_data}, json_output)

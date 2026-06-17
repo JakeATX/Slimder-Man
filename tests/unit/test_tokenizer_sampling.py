@@ -28,6 +28,28 @@ def test_text_calibration_sampling_can_use_tokenizer(tmp_path: Path):
     assert manifest["sample_count"] == 2
     assert manifest["sequence_length"] == 3
     assert len(manifest["dataset_hash"]) == 64
+    assert manifest["tokenizer_fingerprint"]["class"] == "DummyTokenizer"
+    assert len(manifest["tokenizer_fingerprint"]["fingerprint_sha256"]) == 64
+
+
+def test_tokenizer_fingerprint_distinguishes_same_class_different_behavior(tmp_path: Path):
+    class OffsetTokenizer(DummyTokenizer):
+        def __init__(self, offset: int):
+            super().__init__()
+            self.offset = offset
+
+        def encode(self, text: str, add_special_tokens: bool = False):
+            return [token + self.offset for token in super().encode(text, add_special_tokens=add_special_tokens)]
+
+    path = tmp_path / "sample.txt"
+    path.write_text("alpha beta gamma delta", encoding="utf-8")
+    cfg = CalibrationConfig(dataset=DatasetConfig(type="text", path=str(path)), sample_count=1, sequence_length=4)
+
+    _, manifest_a = sample_calibration_tokens(cfg, vocab_size=128, tokenizer=OffsetTokenizer(0))
+    _, manifest_b = sample_calibration_tokens(cfg, vocab_size=128, tokenizer=OffsetTokenizer(7))
+
+    assert manifest_a["tokenizer"] == manifest_b["tokenizer"] == "OffsetTokenizer"
+    assert manifest_a["tokenizer_fingerprint"]["fingerprint_sha256"] != manifest_b["tokenizer_fingerprint"]["fingerprint_sha256"]
 
 
 def test_tokenized_pt_sampling_uses_weights_only_load(monkeypatch, tmp_path: Path):
