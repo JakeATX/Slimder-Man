@@ -36,6 +36,11 @@ def test_run_dryrun_accepts_transformers_config_without_loading_model(tmp_path: 
     assert payload["teacher"]["load_mode"] == "transformers"
     assert payload["teacher"]["model_id_or_path"] == "Qwen/Qwen3-Next-80B-A3B-Instruct"
     assert payload["stages"][0]["compress"] is True
+    assert len(payload["local"]["commands"]) == 5
+    assert "cli analyze" in payload["local"]["commands"][0]
+    assert "cli compress" in payload["local"]["commands"][2]
+    assert "cli run" not in " ".join(payload["local"]["commands"])
+    assert any(check["name"] == "full_model_local_run" for check in payload["local"]["preflight"])
 
 
 def test_run_executes_checked_in_hf_dummy_pipeline_without_monkeypatch(tmp_path: Path):

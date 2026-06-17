@@ -224,8 +224,8 @@ def _forward_validation_errors(model, kind: str) -> list[str]:
     return errors
 
 
-def _dry_run_plan(cfg: SlimderConfig) -> dict:
-    return {
+def _dry_run_plan(cfg: SlimderConfig, config_path: Path | None = None) -> dict:
+    result = {
         "status": "dry_run",
         "teacher": {
             "load_mode": cfg.teacher.load_mode,
@@ -248,6 +248,14 @@ def _dry_run_plan(cfg: SlimderConfig) -> dict:
         ],
         "paper_faithful": cfg.project.paper_faithful,
     }
+    if config_path is not None:
+        local_plan = local_dry_run_commands(config_path, cfg)
+        result["local"] = {
+            "commands": local_plan.commands,
+            "preflight": local_plan.preflight,
+            "output_dir": local_plan.output_dir,
+        }
+    return result
 
 
 @app.callback()
@@ -354,7 +362,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
     cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
     if dry_run:
-        _echo(_dry_run_plan(cfg), json_output)
+        _echo(_dry_run_plan(cfg, config), json_output)
         return
     if cfg.teacher.load_mode != "tiny":
         if cfg.teacher.model_id_or_path != "dummy-hf-moe":
