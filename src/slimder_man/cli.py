@@ -46,6 +46,13 @@ def _load_or_default(path: Optional[Path]) -> SlimderConfig:
     return load_config(path) if path else tiny_default_config()
 
 
+def _resolve_config_path(config: Path | None, config_option: Path | None = None) -> Path:
+    resolved = config_option or config
+    if resolved is None:
+        raise typer.BadParameter("A config path is required")
+    return resolved
+
+
 def _tiny_teacher(cfg: SlimderConfig) -> TinyMoEForCausalLM:
     if cfg.teacher.load_mode != "tiny":
         raise typer.BadParameter("Tiny-only operation requested for a non-tiny teacher")
@@ -53,6 +60,10 @@ def _tiny_teacher(cfg: SlimderConfig) -> TinyMoEForCausalLM:
 
 
 def _load_transformers_model(cfg: SlimderConfig):
+    if cfg.teacher.model_id_or_path == "dummy-hf-moe":
+        from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM
+
+        return DummyHfMoeForCausalLM()
     from transformers import AutoModelForCausalLM
     import torch
 
@@ -67,6 +78,10 @@ def _load_transformers_model(cfg: SlimderConfig):
 
 
 def _load_transformers_checkpoint(cfg: SlimderConfig, checkpoint: Path):
+    if cfg.teacher.model_id_or_path == "dummy-hf-moe":
+        from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM
+
+        return DummyHfMoeForCausalLM.from_pretrained(checkpoint)
     from transformers import AutoModelForCausalLM
     import torch
 
@@ -80,6 +95,10 @@ def _load_transformers_checkpoint(cfg: SlimderConfig, checkpoint: Path):
 
 
 def _load_transformers_tokenizer(cfg: SlimderConfig):
+    if cfg.teacher.model_id_or_path == "dummy-hf-moe":
+        from slimder_man.adapters.hf_dummy import DummyTokenizer
+
+        return DummyTokenizer()
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
@@ -174,8 +193,13 @@ def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "b
     _echo({"preset": preset, "candidates": recs}, json_output)
 
 @app.command()
-def compress(config: Path, stage: int = 1, json_output: bool = typer.Option(False, "--json")) -> None:
-    cfg = load_config(config)
+def compress(
+    config: Path | None = typer.Argument(None),
+    config_option: Path | None = typer.Option(None, "--config"),
+    stage: int = 1,
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    cfg = load_config(_resolve_config_path(config, config_option))
     set_seed(cfg.project.seed)
     out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     teacher = _load_model(cfg)
@@ -188,7 +212,7 @@ def compress(config: Path, stage: int = 1, json_output: bool = typer.Option(Fals
     else:
         adapter = get_adapter(teacher)
         cal = collect_calibration(teacher, batches, adapter)
-        student, manifest = compress_model(teacher, cfg, cal, adapter=adapter, output_dir=out_dir)
+        student, manifest = compress_model(teacher, cfg, cal, adapter=adapter, output_dir=out_dir, tokenizer=tokenizer)
     _echo({"checkpoint": str(out_dir), "manifest": manifest, "params": sum(p.numel() for p in student.parameters())}, json_output)
 
 

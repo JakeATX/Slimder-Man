@@ -18,6 +18,96 @@ from slimder_man.config.schema import SlimderConfig
 from slimder_man.utils.hashing import sha256_file
 
 
+MODEL_ARTIFACT_NAMES = {"config.json", "generation_config.json", "model.safetensors", "pytorch_model.bin"}
+TOKENIZER_ARTIFACT_NAMES = {
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "vocab.txt",
+    "merges.txt",
+    "sentencepiece.bpe.model",
+    "spiece.model",
+    "added_tokens.json",
+}
+
+
+def _relative_file(path: Path, root: Path) -> str | None:
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+        if not resolved.is_file() or not resolved.is_relative_to(root_resolved):
+            return None
+        return resolved.relative_to(root_resolved).as_posix()
+    except OSError:
+        return None
+
+
+def _flatten_saved_paths(value) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    if isinstance(value, dict):
+        paths: list[Path] = []
+        for item in value.values():
+            paths.extend(_flatten_saved_paths(item))
+        return paths
+    if isinstance(value, (list, tuple, set)):
+        paths = []
+        for item in value:
+            paths.extend(_flatten_saved_paths(item))
+        return paths
+    return []
+
+
+def _hash_model_artifacts(output_dir: Path) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name
+        if (
+            name in MODEL_ARTIFACT_NAMES
+            or name.startswith("model-") and name.endswith(".safetensors")
+            or name.startswith("pytorch_model-") and name.endswith(".bin")
+            or name.endswith(".safetensors.index.json")
+            or name.endswith(".bin.index.json")
+        ):
+            rel = path.relative_to(output_dir).as_posix()
+            hashes[rel] = sha256_file(path)
+    return hashes
+
+
+def _save_tokenizer_artifacts(tokenizer, output_dir: Path) -> dict[str, str]:
+    if tokenizer is None:
+        return {}
+    if not hasattr(tokenizer, "save_pretrained"):
+        raise ValueError("Tokenizer object does not expose save_pretrained")
+    config_path = output_dir / "config.json"
+    config_hash_before = sha256_file(config_path) if config_path.exists() else None
+    saved = tokenizer.save_pretrained(output_dir)
+    if config_hash_before is not None:
+        if not config_path.exists():
+            raise ValueError("Tokenizer save_pretrained removed model config.json")
+        if sha256_file(config_path) != config_hash_before:
+            raise ValueError("Tokenizer save_pretrained modified model config.json")
+    candidates = set()
+    for saved_path in _flatten_saved_paths(saved):
+        rel = _relative_file(saved_path, output_dir)
+        if rel is not None:
+            candidates.add(rel)
+    for path in output_dir.rglob("*"):
+        if path.is_file() and path.name in TOKENIZER_ARTIFACT_NAMES:
+            candidates.add(path.relative_to(output_dir).as_posix())
+    hashes: dict[str, str] = {}
+    for name in sorted(candidates):
+        path = output_dir / name
+        if path.is_file():
+            hashes[name] = sha256_file(path)
+    return hashes
+
+
 def _resolve_expert_importance(calibration: CalibrationResult, metric: str, layer_idx: int) -> torch.Tensor:
     metrics = {
         "frequency": calibration.expert_frequency,
@@ -141,7 +231,7 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
     return student, manifest
 
 
-def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, adapter=None, output_dir: str | Path | None = None):
+def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, adapter=None, output_dir: str | Path | None = None, tokenizer=None):
     if isinstance(model, TinyMoEForCausalLM):
         return compress_tiny_model(model, cfg, calibration, output_dir)
 
@@ -204,13 +294,16 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
     if not torch.isfinite(out.logits).all() or (out.loss is not None and not torch.isfinite(out.loss)):
         raise ValueError("Compressed model failed finite forward validation")
     if output_dir is not None:
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-        adapter.save_pretrained(student, str(output_dir), manifest)
-        hashes = {}
-        for filename in ("model.safetensors", "pytorch_model.bin", "config.json"):
-            path = Path(output_dir) / filename
-            if path.exists():
-                hashes[filename] = sha256_file(path)
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        adapter.save_pretrained(student, str(out_path), manifest)
+        tokenizer_hashes = _save_tokenizer_artifacts(tokenizer, out_path)
+        hashes = _hash_model_artifacts(out_path)
+        hashes.update(tokenizer_hashes)
         manifest["artifact_hashes"] = hashes
-        save_manifest(Path(output_dir) / "compression_manifest.json", manifest)
+        if tokenizer_hashes:
+            manifest["tokenizer"] = {"saved": True, "artifact_hashes": tokenizer_hashes}
+        else:
+            manifest["tokenizer"] = {"saved": False}
+        save_manifest(out_path / "compression_manifest.json", manifest)
     return student, manifest

@@ -63,6 +63,11 @@ class ManifestParamCounts(StrictModel):
     actual_after: int | None = None
 
 
+class ManifestTokenizer(StrictModel):
+    saved: bool
+    artifact_hashes: dict[str, str] = Field(default_factory=dict)
+
+
 class CompressionManifest(StrictModel):
     schema_version: str = "1.0"
     paper_faithful: bool
@@ -77,6 +82,7 @@ class CompressionManifest(StrictModel):
     router: ManifestRouter
     param_counts: ManifestParamCounts
     artifact_hashes: dict[str, str] = Field(default_factory=dict)
+    tokenizer: ManifestTokenizer = Field(default_factory=lambda: ManifestTokenizer(saved=False))
 
     @model_validator(mode="after")
     def validate_shapes(self) -> "CompressionManifest":

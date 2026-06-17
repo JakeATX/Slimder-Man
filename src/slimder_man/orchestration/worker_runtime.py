@@ -114,9 +114,10 @@ class WorkerJobStore:
 
     def get(self, job_id: str) -> dict[str, Any]:
         path = self._job_path(job_id)
-        if not path.exists():
-            return {"id": job_id, "status": "missing"}
-        return json.loads(path.read_text(encoding="utf-8"))
+        with self._lock:
+            if not path.exists():
+                return {"id": job_id, "status": "missing"}
+            return json.loads(path.read_text(encoding="utf-8"))
 
     def logs(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
@@ -178,7 +179,10 @@ class WorkerJobStore:
 
     def _write(self, job: dict[str, Any]) -> None:
         with self._lock:
-            self._job_path(job["id"]).write_text(json.dumps(job, indent=2, sort_keys=True), encoding="utf-8")
+            path = self._job_path(job["id"])
+            tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            tmp_path.write_text(json.dumps(job, indent=2, sort_keys=True), encoding="utf-8")
+            os.replace(tmp_path, path)
 
     def _job_path(self, job_id: str) -> Path:
         return self.jobs_dir / f"{job_id}.json"

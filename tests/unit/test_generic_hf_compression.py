@@ -10,11 +10,47 @@ from slimder_man.calibration.collectors import collect_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.compression.apply import compress_model
 from slimder_man.compression.manifests import load_manifest
-from slimder_man.config.schema import SlimderConfig
+from slimder_man.config.schema import SlimderConfig, save_config
 from slimder_man.distill.train_loop import train_causal_lm_distill
+from slimder_man.utils.hashing import sha256_file
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from fixtures.hf_dummy_moe import DummyHfMoeConfig, DummyHfMoeForCausalLM
+from fixtures.hf_dummy_moe import DummyHfMoeConfig, DummyHfMoeForCausalLM, DummyTokenizer
+
+
+class MultiFileTokenizer(DummyTokenizer):
+    def __init__(self, marker: str = "first"):
+        self.marker = marker
+
+    def save_pretrained(self, output_dir: str | Path):
+        path = Path(output_dir)
+        super().save_pretrained(path)
+        files = []
+        for name, content in {
+            "tokenizer.json": f'{{"marker": "{self.marker}"}}',
+            "special_tokens_map.json": '{"pad_token": "<pad>"}',
+            "vocab.txt": "<pad>\nhello\nworld\n",
+        }.items():
+            target = path / name
+            target.write_text(content, encoding="utf-8")
+            files.append(str(target))
+        return files
+
+
+class ConfigClobberingTokenizer(DummyTokenizer):
+    def save_pretrained(self, output_dir: str | Path):
+        super().save_pretrained(output_dir)
+        (Path(output_dir) / "config.json").write_text('{"not": "a model config"}', encoding="utf-8")
+
+
+class ConfigDeletingTokenizer(DummyTokenizer):
+    def save_pretrained(self, output_dir: str | Path):
+        super().save_pretrained(output_dir)
+        (Path(output_dir) / "config.json").unlink()
+
+
+class NotATokenizer:
+    pass
 
 
 def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
@@ -36,7 +72,7 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     )
     depth_expert_student, _ = compress_model(teacher, depth_expert_cfg, calibration, adapter=adapter)
 
-    student, manifest = compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "ckpt")
+    student, manifest = compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "ckpt", tokenizer=DummyTokenizer())
 
     assert len(student.model.layers) == 2
     assert len(student.model.layers[0].mlp.experts) == 4
@@ -63,10 +99,16 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     assert manifest["width"]["hidden_keep_indices"] == list(range(8, 32))
     assert manifest["param_counts"]["after"] < sum(p.numel() for p in depth_expert_student.parameters())
     assert (tmp_path / "ckpt" / "model.safetensors").exists()
+    assert (tmp_path / "ckpt" / "tokenizer_config.json").exists()
     loaded_manifest = load_manifest(tmp_path / "ckpt" / "compression_manifest.json")
     assert loaded_manifest["experts"]["layers"][0]["importance_metric_used"] == "soft_logits"
     assert loaded_manifest["experts"]["layers"][0]["score_vector"]
     assert loaded_manifest["width"]["hidden_keep_indices"] == list(range(8, 32))
+    assert loaded_manifest["tokenizer"]["saved"] is True
+    assert loaded_manifest["tokenizer"]["artifact_hashes"]["tokenizer_config.json"] == sha256_file(tmp_path / "ckpt" / "tokenizer_config.json")
+    assert loaded_manifest["artifact_hashes"]["tokenizer_config.json"] == sha256_file(tmp_path / "ckpt" / "tokenizer_config.json")
+    for name, digest in loaded_manifest["artifact_hashes"].items():
+        assert digest == sha256_file(tmp_path / "ckpt" / name)
     reloaded = DummyHfMoeForCausalLM.from_pretrained(tmp_path / "ckpt")
     assert len(reloaded.model.layers) == 2
     assert reloaded.config.hidden_size == 24
@@ -82,6 +124,103 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     assert train["global_step"] == 1
     assert train["logs"][0]["loss"] > 0
     assert (tmp_path / "training" / "final" / "model.safetensors").exists()
+
+
+def test_cli_transformers_compress_saves_tokenizer_artifacts(monkeypatch, tmp_path: Path):
+    from typer.testing import CliRunner
+
+    from slimder_man import cli
+
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path / "run"), "paper_faithful": True},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        compression={"target": {"hidden_size": 24, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+    )
+    config_path = tmp_path / "hf_dummy.yaml"
+    save_config(cfg, config_path)
+    monkeypatch.setattr(cli, "_load_model", lambda _cfg: DummyHfMoeForCausalLM())
+    monkeypatch.setattr(cli, "_load_tokenizer", lambda _cfg: DummyTokenizer())
+
+    result = CliRunner().invoke(cli.app, ["compress", "--config", str(config_path), "--json"])
+
+    assert result.exit_code == 0, result.output
+    ckpt = tmp_path / "run" / "checkpoints" / "stage_1_compressed"
+    manifest = load_manifest(ckpt / "compression_manifest.json")
+    assert (ckpt / "model.safetensors").exists()
+    assert (ckpt / "config.json").exists()
+    assert (ckpt / "tokenizer_config.json").exists()
+    assert manifest["tokenizer"]["saved"] is True
+    assert manifest["tokenizer"]["artifact_hashes"]["tokenizer_config.json"] == sha256_file(ckpt / "tokenizer_config.json")
+    assert manifest["artifact_hashes"]["tokenizer_config.json"] == sha256_file(ckpt / "tokenizer_config.json")
+
+
+def test_checked_in_hf_dummy_config_runs_without_monkeypatch(tmp_path: Path):
+    from typer.testing import CliRunner
+
+    from slimder_man import cli
+
+    config_path = Path("src/slimder_man/config/examples/hf_dummy.yaml").resolve()
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(cli.app, ["compress", "--config", str(config_path), "--json"])
+        ckpt = Path("runs/hf_dummy_moe_smoke/checkpoints/stage_1_compressed")
+        assert result.exit_code == 0, result.output
+        assert (ckpt / "model.safetensors").exists()
+        assert (ckpt / "config.json").exists()
+        assert (ckpt / "tokenizer_config.json").exists()
+        manifest = load_manifest(ckpt / "compression_manifest.json")
+        assert manifest["teacher_model"] == "dummy-hf-moe"
+        assert manifest["tokenizer"]["saved"] is True
+        assert manifest["artifact_hashes"]["tokenizer_config.json"] == sha256_file(ckpt / "tokenizer_config.json")
+
+
+def test_hf_compression_hashes_multifile_tokenizer_and_reruns(tmp_path: Path):
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path), "paper_faithful": True},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        compression={"target": {"hidden_size": 24, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+    )
+    teacher = DummyHfMoeForCausalLM()
+    adapter = get_adapter(teacher)
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+    calibration = collect_calibration(teacher, batches, adapter)
+    out_dir = tmp_path / "ckpt"
+
+    compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=out_dir, tokenizer=MultiFileTokenizer("first"))
+    _, manifest = compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=out_dir, tokenizer=MultiFileTokenizer("second"))
+
+    expected_tokenizer_files = {"tokenizer_config.json", "tokenizer.json", "special_tokens_map.json", "vocab.txt"}
+    assert expected_tokenizer_files.issubset(manifest["tokenizer"]["artifact_hashes"])
+    assert expected_tokenizer_files.issubset(manifest["artifact_hashes"])
+    assert (out_dir / "tokenizer.json").read_text(encoding="utf-8") == '{"marker": "second"}'
+    for name in expected_tokenizer_files | {"config.json", "model.safetensors"}:
+        assert manifest["artifact_hashes"][name] == sha256_file(out_dir / name)
+    reloaded = DummyHfMoeForCausalLM.from_pretrained(out_dir)
+    tokenizer_ids = MultiFileTokenizer()(["hello world"], max_length=4)["input_ids"]
+    out = reloaded(input_ids=tokenizer_ids, labels=tokenizer_ids)
+    assert out.loss is not None and torch.isfinite(out.loss)
+
+
+def test_hf_compression_rejects_invalid_or_clobbering_tokenizer(tmp_path: Path):
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path), "paper_faithful": True},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        compression={"target": {"hidden_size": 24, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+    )
+    teacher = DummyHfMoeForCausalLM()
+    adapter = get_adapter(teacher)
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+    calibration = collect_calibration(teacher, batches, adapter)
+
+    with pytest.raises(ValueError, match="does not expose save_pretrained"):
+        compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "bad_tokenizer", tokenizer=NotATokenizer())
+    with pytest.raises(ValueError, match="modified model config.json"):
+        compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "clobber", tokenizer=ConfigClobberingTokenizer())
+    with pytest.raises(ValueError, match="removed model config.json"):
+        compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "delete", tokenizer=ConfigDeletingTokenizer())
 
 
 def test_generic_hidden_slicing_preserves_tied_embeddings(tmp_path: Path):

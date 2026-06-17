@@ -1,0 +1,78 @@
+project:
+  name: hf_dummy_moe_smoke
+  output_dir: runs/hf_dummy_moe_smoke
+  seed: 1337
+  paper_faithful: true
+teacher:
+  model_id_or_path: dummy-hf-moe
+  dtype: float32
+  load_mode: transformers
+  trust_remote_code: true
+  device_map: null
+student:
+  init_from: teacher_pruned
+  output_format: hf_safetensors
+  tie_embeddings: auto
+calibration:
+  dataset:
+    type: synthetic
+    split: train
+    text_field: text
+  sample_count: 2
+  sequence_length: 8
+  packing: true
+  seed: 1337
+compression:
+  preset: balanced_50
+  target:
+    hidden_size: 24
+    remove_last_n_layers: 1
+    routed_experts: 4
+    routed_top_k: 2
+    shared_experts: keep
+  depth:
+    method: last_layers
+  width:
+    method: rmsnorm_mean_abs
+    hidden_size_multiple: 4
+  experts:
+    method: partial_preservation_merge
+    importance_metric: soft_logits
+    similarity_metric: router_weights
+    base_selection: next_highest_importance
+    router_row_strategy: base
+    keep_shared_experts: true
+progressive:
+  schedule: one_stage
+  stages: 1
+  token_split: [1.0]
+training:
+  token_budget: 64
+  global_batch_size: 2
+  micro_batch_size: 1
+  sequence_length: 8
+  optimizer: adamw
+  learning_rate: 0.0004
+  min_learning_rate: 0.00003
+  lr_schedule: cosine_decay
+  warmup_steps: 0
+  precision: fp32
+  train_steps: 1
+kd:
+  enabled: true
+  teacher_mode: online_full_logits
+  temperature: 1.0
+  lambda_schedule: {type: linear, start: 1.0, end: 0.75}
+  mtp:
+    enabled: true
+    depths: adapter_default
+    beta_schedule: {type: cosine, start: 0.3, end: 0.1}
+quantization:
+  enabled: false
+evaluation:
+  perplexity: {enabled: true, dataset_name: synthetic, split: test}
+  tasks: []
+  smoke_prompts: true
+  speculative_acceptance: true
+runtime:
+  backend: local
