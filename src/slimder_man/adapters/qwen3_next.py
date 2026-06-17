@@ -111,12 +111,12 @@ class Qwen3NextAdapter:
     def slice_hidden_channels(self, model: nn.Module, keep_idx):
         slice_structural_hidden_channels(model, keep_idx)
 
-    def drop_blocks(self, model: nn.Module, keep_block_idx: list[int]) -> None:  # pragma: no cover
+    def drop_blocks(self, model: nn.Module, keep_block_idx: list[int]) -> None:
         base = getattr(model, "model", model)
         layers = getattr(base, "layers")
         setattr(base, "layers", nn.ModuleList([layers[i] for i in keep_block_idx]))
 
-    def replace_experts(self, moe: nn.Module, new_experts: list[nn.Module], router_rows, new_top_k: int) -> None:  # pragma: no cover
+    def replace_experts(self, moe: nn.Module, new_experts: list[nn.Module], router_rows, new_top_k: int) -> None:
         experts = getattr(moe, "experts", None)
         if isinstance(experts, nn.ModuleList):
             moe.experts = nn.ModuleList(new_experts)
@@ -138,7 +138,7 @@ class Qwen3NextAdapter:
             if hasattr(moe, attr):
                 setattr(moe, attr, min(new_top_k, len(new_experts)))
 
-    def update_config_after_compression(self, model: nn.Module, manifest: dict) -> None:  # pragma: no cover
+    def update_config_after_compression(self, model: nn.Module, manifest: dict) -> None:
         cfg = getattr(model, "config", None)
         if cfg is not None:
             cfg.hidden_size = manifest["target"]["hidden_size"]
@@ -146,5 +146,5 @@ class Qwen3NextAdapter:
             cfg.num_experts = manifest["target"]["routed_experts"]
             cfg.num_experts_per_tok = manifest["target"]["top_k"]
 
-    def save_pretrained(self, model: nn.Module, output_dir: str, manifest: dict | None = None) -> None:  # pragma: no cover
+    def save_pretrained(self, model: nn.Module, output_dir: str, manifest: dict | None = None) -> None:
         model.save_pretrained(output_dir, safe_serialization=True)

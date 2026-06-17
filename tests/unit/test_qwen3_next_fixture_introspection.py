@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import torch
+
 from slimder_man.calibration.collectors import collect_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.compression.apply import compress_model
@@ -62,3 +64,36 @@ def test_qwen3_next_fixture_compresses_width_depth_and_experts(tmp_path: Path):
     assert reloaded.config.attention_hidden_size == 32
     out = reloaded(input_ids=batches[0][:1])
     assert out.logits.shape[-1] == config.vocab_size
+
+
+def test_qwen3_next_adapter_destructive_methods_are_explicitly_covered(tmp_path: Path):
+    config = DummyHfMoeConfig(model_type="qwen3_next")
+    model = DummyHfMoeForCausalLM(config)
+    adapter = Qwen3NextAdapter()
+
+    adapter.drop_blocks(model, [0, 2])
+    assert len(model.model.layers) == 2
+    assert model.model.layers[0] is not model.model.layers[1]
+
+    moe = adapter.iter_moe_layers(model)[0]
+    original_experts = adapter.get_routed_experts(moe)
+    router_rows = adapter.get_router(moe).weight.detach().clone()[:3]
+    adapter.replace_experts(moe, original_experts[:3], router_rows, new_top_k=2)
+    assert len(adapter.get_routed_experts(moe)) == 3
+    assert adapter.get_router(moe).weight.shape == (3, config.hidden_size)
+    assert torch.equal(adapter.get_router(moe).weight.detach(), router_rows.to(adapter.get_router(moe).weight.dtype))
+    assert moe.num_experts_per_tok == 2
+
+    manifest = {
+        "target": {"hidden_size": 24, "routed_experts": 3, "top_k": 2},
+        "depth": {"kept_block_indices": [0, 2]},
+    }
+    adapter.update_config_after_compression(model, manifest)
+    assert model.config.hidden_size == 24
+    assert model.config.num_hidden_layers == 2
+    assert model.config.num_experts == 3
+    assert model.config.num_experts_per_tok == 2
+
+    adapter.save_pretrained(model, str(tmp_path / "qwen_save"))
+    assert (tmp_path / "qwen_save" / "model.safetensors").exists()
+    assert (tmp_path / "qwen_save" / "config.json").exists()
