@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from pathlib import Path
 
 
@@ -13,14 +14,13 @@ def sha256_file(path: str | Path) -> str:
 
 
 def redact_secret(text: str) -> str:
-    markers = ["hf_", "sk-", "ghp_", "github_pat_"]
     out = text
-    for marker in markers:
-        idx = out.find(marker)
-        while idx != -1:
-            end = idx
-            while end < len(out) and (out[end].isalnum() or out[end] in "_-"):
-                end += 1
-            out = out[:idx] + marker + "***REDACTED***" + out[end:]
-            idx = out.find(marker, idx + len(marker) + 14)
+    patterns = [
+        ("hf_", r"hf_[A-Za-z0-9]{8,}"),
+        ("sk-", r"sk-[A-Za-z0-9_-]{8,}"),
+        ("ghp_", r"ghp_[A-Za-z0-9]{8,}"),
+        ("github_pat_", r"github_pat_[A-Za-z0-9_]{8,}"),
+    ]
+    for marker, pattern in patterns:
+        out = re.sub(pattern, marker + "***REDACTED***", out)
     return out

@@ -26,6 +26,7 @@ from slimder_man.config.schema import SlimderConfig, load_config, save_config
 from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_distill
 from slimder_man.distill.stage_runner import run_tiny_progressive_stages
 from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
+from slimder_man.orchestration.local import local_dry_run_commands
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
 from slimder_man.quant.fake_backend import fake_quantize_tiny_model
@@ -478,13 +479,16 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
 
 @app.command()
 def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(False, "--json")) -> None:
-    cfg = load_config(config)
-    if backend == "ssh":
+    cfg = _load_cli_config(config)
+    if backend == "local":
+        plan = local_dry_run_commands(config, cfg)
+        result = {"backend": "local", "commands": plan.commands, "preflight": plan.preflight, "output_dir": plan.output_dir}
+    elif backend == "ssh":
         result = {"backend": "ssh", "commands": ssh_dry_run_commands(cfg).commands}
     elif backend == "skypilot":
         result = {"backend": "skypilot", "yaml": skypilot_yaml(cfg)}
     else:
-        result = {"backend": backend, "status": "local"}
+        result = {"backend": backend, "status": "unsupported"}
     _echo(result, json_output)
 
 
