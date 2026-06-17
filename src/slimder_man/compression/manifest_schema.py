@@ -33,6 +33,9 @@ class ManifestExpertLayer(StrictModel):
     groups: dict[str, list[int]]
     new_expert_order: list[int]
     warning: str | None = None
+    score_vector: list[float] = Field(default_factory=list)
+    importance_metric_used: str | None = None
+    similarity_metric_used: str | None = None
 
     @model_validator(mode="after")
     def all_sets_valid(self) -> "ManifestExpertLayer":

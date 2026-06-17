@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -13,14 +12,14 @@ from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.analyze.architecture import describe_model
 from slimder_man.analyze.recommender import recommend
 from slimder_man.analyze.reports import write_analysis_report
-from slimder_man.calibration.collectors import collect_tiny_calibration
+from slimder_man.calibration.collectors import collect_calibration, collect_tiny_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
-from slimder_man.compression.apply import compress_tiny_model
+from slimder_man.compression.apply import compress_model, compress_tiny_model
 from slimder_man.compression.manifests import load_manifest
 from slimder_man.compression.validate import validate_tiny_model
 from slimder_man.config.defaults import tiny_default_config
 from slimder_man.config.schema import SlimderConfig, load_config, save_config
-from slimder_man.distill.train_loop import train_tiny_distill
+from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_distill
 from slimder_man.eval.perplexity import tiny_perplexity
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
@@ -62,8 +61,61 @@ def _load_transformers_model(cfg: SlimderConfig):
     )
 
 
+def _load_transformers_checkpoint(cfg: SlimderConfig, checkpoint: Path):
+    from transformers import AutoModelForCausalLM
+    import torch
+
+    dtype_map = {"bfloat16": torch.bfloat16, "bf16": torch.bfloat16, "float16": torch.float16, "fp16": torch.float16, "float32": torch.float32, "fp32": torch.float32}
+    return AutoModelForCausalLM.from_pretrained(
+        checkpoint,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+        torch_dtype=dtype_map.get(cfg.teacher.dtype, torch.float32),
+        device_map=cfg.teacher.device_map,
+    )
+
+
+def _load_transformers_tokenizer(cfg: SlimderConfig):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        cfg.teacher.model_id_or_path,
+        revision=cfg.teacher.revision,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+    )
+
+
 def _load_model(cfg: SlimderConfig):
     return _tiny_teacher(cfg) if cfg.teacher.load_mode == "tiny" else _load_transformers_model(cfg)
+
+
+def _load_tokenizer(cfg: SlimderConfig):
+    return None if cfg.teacher.load_mode == "tiny" else _load_transformers_tokenizer(cfg)
+
+
+def _dry_run_plan(cfg: SlimderConfig) -> dict:
+    return {
+        "status": "dry_run",
+        "teacher": {
+            "load_mode": cfg.teacher.load_mode,
+            "model_id_or_path": cfg.teacher.model_id_or_path,
+            "revision": cfg.teacher.revision,
+            "dtype": cfg.teacher.dtype,
+            "device_map": cfg.teacher.device_map,
+        },
+        "target": cfg.compression.target.model_dump(mode="json"),
+        "progressive": cfg.progressive.model_dump(mode="json"),
+        "stages": [
+            {
+                "stage": idx + 1,
+                "analyze": True,
+                "compress": True,
+                "distill": cfg.training.train_steps > 0,
+                "eval": cfg.evaluation.perplexity.enabled,
+            }
+            for idx in range(cfg.progressive.stages)
+        ],
+        "paper_faithful": cfg.project.paper_faithful,
+    }
 
 
 @app.callback()
@@ -92,16 +144,12 @@ def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> 
     cfg = load_config(config)
     model = _load_model(cfg)
     arch = describe_model(model)
-    if cfg.teacher.load_mode != "tiny":
-        out_dir = Path(cfg.project.output_dir) / "analysis"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        recs = recommend(arch, cfg.compression.preset)
-        write_json(out_dir / "architecture.json", arch)
-        write_analysis_report(out_dir / "analysis_report.md", arch, recs, warnings=["Calibration is skipped for non-tiny analyze unless a full model run is explicitly provisioned."])
-        _echo({"architecture": arch, "analysis_dir": str(out_dir), "recommendations": recs}, json_output)
-        return
-    batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
-    cal = collect_tiny_calibration(model, batches)
+    tokenizer = _load_tokenizer(cfg)
+    batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+    if cfg.teacher.load_mode == "tiny":
+        cal = collect_tiny_calibration(model, batches)
+    else:
+        cal = collect_calibration(model, batches, get_adapter(model))
     out_dir = Path(cfg.project.output_dir) / "analysis"
     out_dir.mkdir(parents=True, exist_ok=True)
     recs = recommend(arch, cfg.compression.preset)
@@ -122,35 +170,53 @@ def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "b
 @app.command()
 def compress(config: Path, stage: int = 1, json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
-    if cfg.teacher.load_mode != "tiny":
-        raise typer.BadParameter("Full-checkpoint Qwen3-Next compression is not enabled in this v1 build; use analyze/recommend or the tiny smoke workflow.")
-    teacher = _tiny_teacher(cfg)
-    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
-    cal = collect_tiny_calibration(teacher, batches)
     out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
-    student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir)
+    teacher = _load_model(cfg)
+    arch = describe_model(teacher)
+    tokenizer = _load_tokenizer(cfg)
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+    if cfg.teacher.load_mode == "tiny":
+        cal = collect_tiny_calibration(teacher, batches)
+        student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir)
+    else:
+        adapter = get_adapter(teacher)
+        cal = collect_calibration(teacher, batches, adapter)
+        student, manifest = compress_model(teacher, cfg, cal, adapter=adapter, output_dir=out_dir)
     _echo({"checkpoint": str(out_dir), "manifest": manifest, "params": sum(p.numel() for p in student.parameters())}, json_output)
 
 
 @app.command()
 def distill(config: Path, stage: int = 1, resume: bool = False, json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
-    teacher = _tiny_teacher(cfg)
     ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
-    resume_dir = Path(cfg.project.output_dir) / "training" / "resume_model"
-    if resume and resume_dir.exists():
-        student = TinyMoEForCausalLM.from_pretrained(resume_dir)
+    if cfg.teacher.load_mode == "tiny":
+        teacher = _tiny_teacher(cfg)
+        resume_dir = Path(cfg.project.output_dir) / "training" / "resume_model"
+        if resume and resume_dir.exists():
+            student = TinyMoEForCausalLM.from_pretrained(resume_dir)
+        else:
+            student = TinyMoEForCausalLM.from_pretrained(ckpt) if ckpt.exists() else TinyMoEForCausalLM()
+        result = train_tiny_distill(teacher, student, cfg, Path(cfg.project.output_dir) / "training", resume=resume)
     else:
-        student = TinyMoEForCausalLM.from_pretrained(ckpt) if ckpt.exists() else TinyMoEForCausalLM()
-    result = train_tiny_distill(teacher, student, cfg, Path(cfg.project.output_dir) / "training", resume=resume)
+        if not ckpt.exists():
+            raise typer.BadParameter(f"Compressed checkpoint not found: {ckpt}")
+        teacher = _load_model(cfg)
+        student = _load_transformers_checkpoint(cfg, ckpt)
+        arch = describe_model(student)
+        tokenizer = _load_tokenizer(cfg)
+        batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+        result = train_causal_lm_distill(teacher, student, cfg, Path(cfg.project.output_dir) / "training", batches, resume=resume)
     _echo(result, json_output)
 
 
 @app.command()
-def run(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    if dry_run:
+        _echo(_dry_run_plan(cfg), json_output)
+        return
     if cfg.teacher.load_mode != "tiny":
-        raise typer.BadParameter("Full non-tiny run is intentionally gated in v1; use analyze/recommend for HF models and tiny run for end-to-end smoke.")
+        raise typer.BadParameter("Use --dry-run for full-model orchestration checks, then run analyze/compress/distill stages explicitly on provisioned hardware.")
     teacher = _tiny_teacher(cfg)
     arch = describe_model(teacher)
     batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)

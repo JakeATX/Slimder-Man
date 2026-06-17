@@ -47,7 +47,16 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
         student_out = student(batch)
         lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, step, total_steps)
         beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, step, total_steps)
-        loss, parts = total_distill_loss(student_out, teacher_out, batch, lambda_t, beta_t, cfg.kd.temperature)
+        loss, parts = total_distill_loss(
+            student_out,
+            teacher_out,
+            batch,
+            lambda_t,
+            beta_t,
+            cfg.kd.temperature,
+            kd_enabled=cfg.kd.enabled,
+            mtp_enabled=cfg.kd.mtp.enabled,
+        )
         if not torch.isfinite(loss):
             raise ValueError("NaN or Inf distillation loss")
         loss.backward()
@@ -71,6 +80,76 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
             encoding="utf-8",
         )
     student.save_pretrained(out_dir / "final")
+    report = ["# Slimder Man Training Report", ""]
+    for row in logs:
+        report.append(json.dumps(row, sort_keys=True))
+    (out_dir / "training_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+    return {"global_step": total_steps, "logs": logs, "checkpoint": str(out_dir / "final")}
+
+
+def train_causal_lm_distill(
+    teacher: torch.nn.Module,
+    student: torch.nn.Module,
+    cfg: SlimderConfig,
+    output_dir: str | Path,
+    batches: list[torch.Tensor],
+    resume: bool = False,
+) -> dict:
+    """Small generic HF-style distillation loop used by non-tiny smoke fixtures."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out_dir / "trainer_state.json"
+    start_step = 0
+    if resume and state_path.exists():
+        start_step = json.loads(state_path.read_text(encoding="utf-8")).get("global_step", 0)
+
+    opt = torch.optim.AdamW(student.parameters(), lr=cfg.training.learning_rate)
+    opt_path = out_dir / "optimizer.pt"
+    if resume and opt_path.exists():
+        opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
+
+    total_steps = cfg.training.train_steps
+    logs = []
+    teacher.eval()
+    student.train()
+    for step in range(start_step, total_steps):
+        batch = batches[step % len(batches)]
+        lr = global_cosine_lr(cfg.training.learning_rate, cfg.training.min_learning_rate, cfg.training.warmup_steps, step, total_steps)
+        for group in opt.param_groups:
+            group["lr"] = lr
+        with torch.no_grad():
+            teacher_out = teacher(input_ids=batch)
+        student_out = student(input_ids=batch)
+        lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, step, total_steps)
+        beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, step, total_steps)
+        loss, parts = total_distill_loss(
+            student_out,
+            teacher_out,
+            batch,
+            lambda_t,
+            beta_t,
+            cfg.kd.temperature,
+            kd_enabled=cfg.kd.enabled,
+            mtp_enabled=cfg.kd.mtp.enabled and bool(getattr(student_out, "mtp_logits", [])),
+        )
+        if not torch.isfinite(loss):
+            raise ValueError("NaN or Inf distillation loss")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.training.max_grad_norm)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+        row = {"step": step + 1, "loss": float(loss.detach()), "lambda": lambda_t, "beta": beta_t, "lr": lr, **parts}
+        logs.append(row)
+        torch.save(opt.state_dict(), opt_path)
+        if hasattr(student, "save_pretrained"):
+            student.save_pretrained(out_dir / "resume_model")
+        state_path.write_text(
+            json.dumps({"global_step": step + 1, "logs": logs, "config": cfg.model_dump(mode="json"), "optimizer_state": str(opt_path)}, indent=2),
+            encoding="utf-8",
+        )
+
+    if hasattr(student, "save_pretrained"):
+        student.save_pretrained(out_dir / "final")
     report = ["# Slimder Man Training Report", ""]
     for row in logs:
         report.append(json.dumps(row, sort_keys=True))

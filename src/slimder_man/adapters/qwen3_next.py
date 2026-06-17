@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from .base import ArchitectureInfo, MoELayerInfo, count_parameters, dtype_summary
+from .generic_hf_moe import structural_moe_layers
 
 
 class Qwen3NextAdapter:
@@ -27,7 +28,7 @@ class Qwen3NextAdapter:
         moe_layers = self.iter_moe_layers(model)
         top_k = int(getattr(cfg, "num_experts_per_tok", getattr(cfg, "moe_top_k", 0)) or 0)
         n_experts = int(getattr(cfg, "num_experts", getattr(cfg, "n_routed_experts", 0)) or 0)
-        shared = int(getattr(cfg, "num_shared_experts", 1) or 0)
+        shared = int(getattr(cfg, "num_shared_experts", 0) or 0)
         block_kinds = [self.get_block_kind(layer) for layer in layers]
         emb = getattr(model, "embed_tokens", None) or getattr(getattr(model, "model", None), "embed_tokens", None)
         head = getattr(model, "lm_head", None)
@@ -42,7 +43,15 @@ class Qwen3NextAdapter:
             block_kinds=block_kinds,
             num_full_attention_layers=sum(1 for k in block_kinds if k == "full_attention"),
             num_linear_attention_layers=sum(1 for k in block_kinds if k == "linear_attention"),
-            moe_layers=[MoELayerInfo(i, n_experts or len(self.get_routed_experts(moe)), shared, top_k) for i, moe in enumerate(moe_layers)],
+            moe_layers=[
+                MoELayerInfo(
+                    i,
+                    n_experts or len(self.get_routed_experts(moe)),
+                    shared or len(self.get_shared_experts(moe)),
+                    top_k or int(getattr(moe, "top_k", getattr(moe, "num_experts_per_tok", getattr(moe, "moe_top_k", 0))) or 0),
+                )
+                for i, moe in enumerate(moe_layers)
+            ],
             has_mtp=bool(self.get_mtp_modules(model)),
             mtp_depths=len(self.get_mtp_modules(model)),
             tied_embeddings=tied,
@@ -70,16 +79,13 @@ class Qwen3NextAdapter:
         return [m for _, m in model.named_modules() if m.__class__.__name__.lower().endswith("rmsnorm")]
 
     def iter_moe_layers(self, model: nn.Module) -> list[nn.Module]:
-        out = []
-        for name, module in model.named_modules():
-            lname = name.lower()
-            if ("moe" in lname or "experts" in lname) and hasattr(module, "experts"):
-                out.append(module)
-        return out
+        return structural_moe_layers(model)
 
     def get_routed_experts(self, moe: nn.Module) -> list[nn.Module]:
         experts = getattr(moe, "experts", [])
-        return list(experts.values()) if isinstance(experts, dict) else list(experts)
+        if isinstance(experts, (dict, nn.ModuleDict)):
+            return list(experts.values())
+        return list(experts)
 
     def get_shared_experts(self, moe: nn.Module) -> list[nn.Module]:
         for attr in ("shared_experts", "shared_expert"):
@@ -129,6 +135,10 @@ class Qwen3NextAdapter:
                         module.bias = nn.Parameter(bias.clone())
             elif hasattr(module, "weight") and getattr(module.weight, "ndim", 0) == 1 and module.weight.shape[0] == hidden:
                 module.weight = nn.Parameter(module.weight.detach().index_select(0, keep_idx.to(module.weight.device)).clone())
+                if getattr(module, "bias", None) is not None and module.bias.shape[0] == hidden:
+                    module.bias = nn.Parameter(module.bias.detach().index_select(0, keep_idx.to(module.bias.device)).clone())
+                if isinstance(module, nn.LayerNorm):
+                    module.normalized_shape = (keep_idx.numel(),)
         cfg = getattr(model, "config", None)
         if cfg is not None:
             cfg.hidden_size = keep_idx.numel()
@@ -165,6 +175,8 @@ class Qwen3NextAdapter:
         if cfg is not None:
             cfg.hidden_size = manifest["target"]["hidden_size"]
             cfg.num_hidden_layers = len(manifest["depth"]["kept_block_indices"])
+            cfg.num_experts = manifest["target"]["routed_experts"]
+            cfg.num_experts_per_tok = manifest["target"]["top_k"]
 
     def save_pretrained(self, model: nn.Module, output_dir: str, manifest: dict | None = None) -> None:  # pragma: no cover
         model.save_pretrained(output_dir, safe_serialization=True)

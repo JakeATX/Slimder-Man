@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from torch import nn
 
+from .generic_hf_moe import GenericHfMoeAdapter
 from .qwen3_next import Qwen3NextAdapter
 from .tiny import TinyAdapter
 
 
-ADAPTERS = [TinyAdapter(), Qwen3NextAdapter()]
+ADAPTERS = [TinyAdapter(), Qwen3NextAdapter(), GenericHfMoeAdapter()]
 
 
 def get_adapter(model: nn.Module, config: object | None = None):
