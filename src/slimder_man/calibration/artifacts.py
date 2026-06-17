@@ -91,6 +91,7 @@ def write_calibration_artifacts(
                 "frequency": _cpu_tensor(freq),
                 "soft_logits": _cpu_tensor(soft),
                 "reap": _cpu_tensor(reap),
+                "reap_assigned_token_mean": _cpu_tensor(reap).clone(),
             },
             stats_path,
         )
@@ -121,6 +122,7 @@ def write_calibration_artifacts(
         "representation": calibration.representation,
         "importance_metric": cfg.compression.experts.importance_metric,
         "similarity_metric": cfg.compression.experts.similarity_metric,
+        "reap_convention": "assigned_token_mean_gate_weighted_output_norm2",
         "layers": layer_summaries,
     }
     routing_path = out_path / "routing_summary.json"
@@ -144,6 +146,7 @@ def write_calibration_artifacts(
         "experts": {
             "importance_metric": cfg.compression.experts.importance_metric,
             "similarity_metric": cfg.compression.experts.similarity_metric,
+            "reap_convention": "assigned_token_mean_gate_weighted_output_norm2",
             "available_similarity_metrics": [
                 metric for metric in SIMILARITY_ATTRS if len(_similarity_by_metric(calibration, metric)) > 0
             ],

@@ -8,8 +8,9 @@ from slimder_man.adapters.registry import get_adapter
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.calibration.stats import (
     expert_frequency,
-    expert_reap_importance,
+    expert_reap_numerator_counts,
     expert_soft_importance,
+    finalize_reap_importance,
     streaming_cosine,
 )
 
@@ -34,7 +35,8 @@ def collect_tiny_calibration(model: TinyMoEForCausalLM, batches: list[torch.Tens
     hidden_counts = [0 for _ in hidden_sums]
     expert_freq = [torch.zeros(model.config.num_routed_experts, dtype=torch.float64) for _ in model.layers]
     expert_soft = [torch.zeros(model.config.num_routed_experts, dtype=torch.float64) for _ in model.layers]
-    expert_reap = [torch.zeros(model.config.num_routed_experts, dtype=torch.float64) for _ in model.layers]
+    expert_reap_num = [torch.zeros(model.config.num_routed_experts, dtype=torch.float64) for _ in model.layers]
+    expert_reap_count = [torch.zeros(model.config.num_routed_experts, dtype=torch.float64) for _ in model.layers]
     weight_chunks = [[] for _ in model.layers]
     logit_chunks = [[] for _ in model.layers]
 
@@ -65,7 +67,9 @@ def collect_tiny_calibration(model: TinyMoEForCausalLM, batches: list[torch.Tens
                 norm2 = moe.last_expert_output_norm2.reshape(-1, moe.num_routed_experts)
                 expert_freq[layer_idx] += expert_frequency(topi, moe.num_routed_experts)
                 expert_soft[layer_idx] += expert_soft_importance(topi, topw, moe.num_routed_experts)
-                expert_reap[layer_idx] += expert_reap_importance(topi, topw, norm2, moe.num_routed_experts)
+                reap_num, reap_count = expert_reap_numerator_counts(topi, topw, norm2, moe.num_routed_experts)
+                expert_reap_num[layer_idx] += reap_num
+                expert_reap_count[layer_idx] += reap_count
                 dense_weights = torch.zeros(topi.shape[0], moe.num_routed_experts)
                 for slot in range(topi.shape[1]):
                     dense_weights.scatter_add_(1, topi[:, slot : slot + 1].cpu(), topw[:, slot : slot + 1].cpu())
@@ -81,7 +85,7 @@ def collect_tiny_calibration(model: TinyMoEForCausalLM, batches: list[torch.Tens
         per_layer_hidden_scores=[x.to(torch.float32) for x in per_hidden],
         expert_frequency=[(x / denom).to(torch.float32) for x in expert_freq],
         expert_soft=[(x / denom).to(torch.float32) for x in expert_soft],
-        expert_reap=[(x / denom).to(torch.float32) for x in expert_reap],
+        expert_reap=[finalize_reap_importance(num, count).to(torch.float32) for num, count in zip(expert_reap_num, expert_reap_count, strict=True)],
         expert_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
         router_logits_similarity=[streaming_cosine(chunks) for chunks in logit_chunks],
         router_weights_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
@@ -115,7 +119,8 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
     hidden_counts = [0 for _ in norms]
     expert_freq = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
     expert_soft = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
-    expert_reap = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
+    expert_reap_num = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
+    expert_reap_count = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
     weight_chunks = [[] for _ in moes]
     logit_chunks = [[] for _ in moes]
     handles = []
@@ -148,7 +153,9 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
                 norm2 = norm2.reshape(-1, n)
                 expert_freq[layer_idx] += expert_frequency(topi, n)
                 expert_soft[layer_idx] += expert_soft_importance(topi, topw, n)
-                expert_reap[layer_idx] += expert_reap_importance(topi, topw, norm2, n)
+                reap_num, reap_count = expert_reap_numerator_counts(topi, topw, norm2, n)
+                expert_reap_num[layer_idx] += reap_num
+                expert_reap_count[layer_idx] += reap_count
                 dense_weights = torch.zeros(topi.shape[0], n)
                 for slot in range(topi.shape[1]):
                     dense_weights.scatter_add_(1, topi[:, slot : slot + 1].cpu(), topw[:, slot : slot + 1].cpu())
@@ -164,7 +171,7 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
         per_layer_hidden_scores=[x.to(torch.float32) for x in per_hidden],
         expert_frequency=[(x / denom).to(torch.float32) for x in expert_freq],
         expert_soft=[(x / denom).to(torch.float32) for x in expert_soft],
-        expert_reap=[(x / denom).to(torch.float32) for x in expert_reap],
+        expert_reap=[finalize_reap_importance(num, count).to(torch.float32) for num, count in zip(expert_reap_num, expert_reap_count, strict=True)],
         expert_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
         router_logits_similarity=[streaming_cosine(chunks) for chunks in logit_chunks],
         router_weights_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],

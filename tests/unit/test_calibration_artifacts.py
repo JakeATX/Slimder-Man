@@ -71,8 +71,9 @@ def test_calibration_artifact_writer_persists_tensors_and_provenance(tmp_path: P
     assert len(keep["indices"]) == 16
 
     stats = load_file(out_dir / "expert_stats_layer_0.safetensors")
-    assert set(stats) == {"frequency", "soft_logits", "reap"}
+    assert set(stats) == {"frequency", "soft_logits", "reap", "reap_assigned_token_mean"}
     assert stats["frequency"].shape == (model.config.num_experts,)
+    assert torch.equal(stats["reap"], stats["reap_assigned_token_mean"])
     sim = load_file(out_dir / "expert_similarity_layer_0_router_logits.safetensors")["similarity"]
     assert sim.shape == (model.config.num_experts, model.config.num_experts)
     assert torch.allclose(sim, sim.T)
@@ -80,6 +81,7 @@ def test_calibration_artifact_writer_persists_tensors_and_provenance(tmp_path: P
     written_manifest = json.loads((out_dir / "calibration_manifest.json").read_text(encoding="utf-8"))
     assert written_manifest == manifest
     assert written_manifest["calibration"]["sample_hashes"] == source_manifest["sample_hashes"]
+    assert written_manifest["experts"]["reap_convention"] == "assigned_token_mean_gate_weighted_output_norm2"
     assert len(written_manifest["calibration"]["sample_hashes"]) == 2
     assert written_manifest["calibration"]["source"]["source_hash"]
     for artifact in written_manifest["artifacts"].values():
@@ -108,5 +110,6 @@ def test_non_tiny_analyze_writes_calibration_artifacts(monkeypatch, tmp_path: Pa
     assert manifest["experts"]["similarity_metric"] == "expert_outputs"
     assert manifest["calibration"]["tokenizer"] == "DummyTokenizer"
     assert routing["similarity_metric"] == "expert_outputs"
+    assert routing["reap_convention"] == "assigned_token_mean_gate_weighted_output_norm2"
     assert (analysis_dir / "hidden_importance.safetensors").exists()
     assert (analysis_dir / "expert_similarity_layer_0_expert_outputs.safetensors").exists()

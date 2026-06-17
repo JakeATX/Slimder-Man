@@ -24,14 +24,46 @@ def expert_soft_importance(topk_indices: torch.Tensor, topk_weights: torch.Tenso
 
 
 def expert_reap_importance(topk_indices: torch.Tensor, topk_weights: torch.Tensor, output_norm2: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """REAP-style importance as mean gate-weighted output norm over assigned tokens.
+
+    Unselected experts remain exactly zero. This intentionally uses the
+    assigned-token divisor, not total-token normalization.
+    """
     scores = torch.zeros(num_experts, dtype=torch.float64)
+    counts = torch.zeros(num_experts, dtype=torch.float64)
     for slot in range(topk_indices.shape[1]):
         idx = topk_indices[:, slot].cpu()
         weights = topk_weights[:, slot].detach().cpu().to(torch.float64)
         norm = output_norm2.detach().cpu().to(torch.float64).gather(1, idx.unsqueeze(1)).squeeze(1)
         scores.scatter_add_(0, idx, weights * norm)
-    if topk_indices.shape[0] > 0:
-        scores /= topk_indices.shape[0]
+        counts.scatter_add_(0, idx, torch.ones_like(weights, dtype=torch.float64))
+    mask = counts > 0
+    scores[mask] /= counts[mask]
+    return scores
+
+
+def expert_reap_numerator_counts(
+    topk_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    output_norm2: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    numerator = torch.zeros(num_experts, dtype=torch.float64)
+    counts = torch.zeros(num_experts, dtype=torch.float64)
+    for slot in range(topk_indices.shape[1]):
+        idx = topk_indices[:, slot].cpu()
+        weights = topk_weights[:, slot].detach().cpu().to(torch.float64)
+        norm = output_norm2.detach().cpu().to(torch.float64).gather(1, idx.unsqueeze(1)).squeeze(1)
+        numerator.scatter_add_(0, idx, weights * norm)
+        counts.scatter_add_(0, idx, torch.ones_like(weights, dtype=torch.float64))
+    return numerator, counts
+
+
+def finalize_reap_importance(numerator: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    scores = numerator.clone()
+    mask = counts > 0
+    scores[mask] /= counts[mask]
+    scores[~mask] = 0
     return scores
 
 
