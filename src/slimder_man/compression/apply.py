@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
+import inspect
 from types import SimpleNamespace
 
 import torch
@@ -77,6 +78,42 @@ def _hash_model_artifacts(output_dir: Path) -> dict[str, str]:
             rel = path.relative_to(output_dir).as_posix()
             hashes[rel] = sha256_file(path)
     return hashes
+
+
+def _has_safetensors_checkpoint(output_dir: Path) -> bool:
+    return (
+        (output_dir / "model.safetensors").exists()
+        or any(output_dir.glob("model-*.safetensors"))
+        or (output_dir / "model.safetensors.index.json").exists()
+    )
+
+
+def _has_torch_checkpoint(output_dir: Path) -> bool:
+    return (
+        (output_dir / "pytorch_model.bin").exists()
+        or any(output_dir.glob("pytorch_model-*.bin"))
+        or (output_dir / "pytorch_model.bin.index.json").exists()
+    )
+
+
+def _save_transformers_checkpoint(model, adapter, output_dir: Path, manifest: dict, output_format: str) -> None:
+    safe_serialization = output_format == "hf_safetensors"
+    if hasattr(model, "save_pretrained"):
+        save_pretrained = model.save_pretrained
+        signature = inspect.signature(save_pretrained)
+        accepts_safe_serialization = "safe_serialization" in signature.parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+        )
+        if accepts_safe_serialization:
+            model.save_pretrained(output_dir, safe_serialization=safe_serialization)
+        else:
+            model.save_pretrained(output_dir)
+    else:
+        adapter.save_pretrained(model, str(output_dir), manifest)
+    if output_format == "hf_safetensors" and not _has_safetensors_checkpoint(output_dir):
+        raise ValueError("student.output_format=hf_safetensors did not produce a safetensors checkpoint")
+    if output_format == "torch" and not _has_torch_checkpoint(output_dir):
+        raise ValueError("student.output_format=torch did not produce a PyTorch checkpoint")
 
 
 def _save_tokenizer_artifacts(tokenizer, output_dir: Path) -> dict[str, str]:
@@ -190,6 +227,7 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
         "paper_faithful": cfg.project.paper_faithful,
         "teacher_model": cfg.teacher.model_id_or_path,
         "teacher_revision": cfg.teacher.revision,
+        "student_output_format": "torch",
         "seed": cfg.project.seed,
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
         "target": {
@@ -278,6 +316,7 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
         "paper_faithful": cfg.project.paper_faithful,
         "teacher_model": cfg.teacher.model_id_or_path,
         "teacher_revision": cfg.teacher.revision,
+        "student_output_format": cfg.student.output_format,
         "seed": cfg.project.seed,
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
         "target": {"hidden_size": target.hidden_size, "remove_last_n_layers": target.remove_last_n_layers, "routed_experts": target.routed_experts, "top_k": target.routed_top_k},
@@ -296,7 +335,7 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
     if output_dir is not None:
         out_path = Path(output_dir)
         out_path.mkdir(parents=True, exist_ok=True)
-        adapter.save_pretrained(student, str(out_path), manifest)
+        _save_transformers_checkpoint(student, adapter, out_path, manifest, cfg.student.output_format)
         tokenizer_hashes = _save_tokenizer_artifacts(tokenizer, out_path)
         hashes = _hash_model_artifacts(out_path)
         hashes.update(tokenizer_hashes)

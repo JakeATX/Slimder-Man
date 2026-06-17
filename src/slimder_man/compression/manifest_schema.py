@@ -73,6 +73,7 @@ class CompressionManifest(StrictModel):
     paper_faithful: bool
     teacher_model: str
     teacher_revision: str | None = None
+    student_output_format: str | None = None
     seed: int
     calibration: dict
     target: ManifestTarget
