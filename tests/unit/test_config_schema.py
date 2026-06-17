@@ -42,3 +42,16 @@ def test_augmented_config_accepts_saliency_quantization():
 def test_nested_unknown_fields_are_rejected():
     with pytest.raises(ValidationError):
         SlimderConfig(compression={"depth": {"methdo": "last_layers"}})
+
+
+def test_unimplemented_param_reduction_targets_are_rejected():
+    with pytest.raises(ValidationError, match="total_param_reduction"):
+        SlimderConfig(compression={"target": {"total_param_reduction": 0.5}})
+    with pytest.raises(ValidationError, match="active_param_reduction"):
+        SlimderConfig(compression={"target": {"active_param_reduction": 0.5}})
+
+
+def test_depth_remove_fraction_schema_bounds():
+    assert SlimderConfig(compression={"target": {"depth_remove_fraction": 0.25}}).compression.target.depth_remove_fraction == 0.25
+    with pytest.raises(ValidationError, match="depth_remove_fraction"):
+        SlimderConfig(compression={"target": {"depth_remove_fraction": 1.0}})
