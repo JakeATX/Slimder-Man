@@ -155,6 +155,25 @@ def test_generic_hf_compression_honors_torch_output_format(tmp_path: Path):
     assert out.loss is not None and torch.isfinite(out.loss)
 
 
+def test_generic_hf_compression_honors_depth_remove_fraction(tmp_path: Path):
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path), "paper_faithful": True},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        compression={"target": {"hidden_size": 32, "depth_remove_fraction": 0.5, "remove_last_n_layers": 0, "routed_experts": 6, "routed_top_k": 2}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+    )
+    teacher = DummyHfMoeForCausalLM(DummyHfMoeConfig(num_hidden_layers=4))
+    adapter = get_adapter(teacher)
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+    calibration = collect_calibration(teacher, batches, adapter)
+
+    student, manifest = compress_model(teacher, cfg, calibration, adapter=adapter)
+
+    assert len(student.model.layers) == 2
+    assert manifest["target"]["remove_last_n_layers"] == 2
+    assert manifest["depth"]["kept_block_indices"] == [0, 1]
+
+
 def test_cli_transformers_compress_saves_tokenizer_artifacts(monkeypatch, tmp_path: Path):
     from typer.testing import CliRunner
 

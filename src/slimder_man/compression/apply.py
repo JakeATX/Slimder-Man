@@ -10,7 +10,7 @@ import torch
 from slimder_man.adapters.registry import get_adapter
 from slimder_man.adapters.tiny import TinyAdapter, TinyMoEForCausalLM, clone_tiny_model
 from slimder_man.calibration.collectors import CalibrationResult, hidden_keep_indices
-from slimder_man.compression.depth import compute_depth_keep_indices
+from slimder_man.compression.depth import compute_depth_keep_indices, resolve_remove_last_n
 from slimder_man.compression.experts import merge_experts
 from slimder_man.compression.manifests import save_manifest
 from slimder_man.compression.router import router_rows_for_merge
@@ -195,7 +195,8 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
     student = clone_tiny_model(model)
     adapter = TinyAdapter()
     target = cfg.compression.target
-    keep_blocks = compute_depth_keep_indices(len(student.layers), target.remove_last_n_layers)
+    remove_last_n_layers = resolve_remove_last_n(len(student.layers), target.remove_last_n_layers, target.depth_remove_fraction)
+    keep_blocks = compute_depth_keep_indices(len(student.layers), remove_last_n_layers)
     adapter.drop_blocks(student, keep_blocks)
     keep_idx = hidden_keep_indices(calibration.hidden_scores, target.hidden_size)
     adapter.slice_hidden_channels(student, keep_idx)
@@ -232,7 +233,7 @@ def compress_tiny_model(model: TinyMoEForCausalLM, cfg: SlimderConfig, calibrati
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
         "target": {
             "hidden_size": target.hidden_size,
-            "remove_last_n_layers": target.remove_last_n_layers,
+            "remove_last_n_layers": remove_last_n_layers,
             "routed_experts": target.routed_experts,
             "top_k": target.routed_top_k,
         },
@@ -276,7 +277,9 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
     student = deepcopy(model)
     adapter = adapter or get_adapter(student)
     target = cfg.compression.target
-    keep_blocks = compute_depth_keep_indices(len(adapter.iter_transformer_blocks(student)), target.remove_last_n_layers)
+    source_layers = len(adapter.iter_transformer_blocks(student))
+    remove_last_n_layers = resolve_remove_last_n(source_layers, target.remove_last_n_layers, target.depth_remove_fraction)
+    keep_blocks = compute_depth_keep_indices(source_layers, remove_last_n_layers)
     adapter.drop_blocks(student, keep_blocks)
 
     current_hidden = adapter.describe_architecture(student).hidden_size
@@ -319,7 +322,7 @@ def compress_model(model, cfg: SlimderConfig, calibration: CalibrationResult, ad
         "student_output_format": cfg.student.output_format,
         "seed": cfg.project.seed,
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
-        "target": {"hidden_size": target.hidden_size, "remove_last_n_layers": target.remove_last_n_layers, "routed_experts": target.routed_experts, "top_k": target.routed_top_k},
+        "target": {"hidden_size": target.hidden_size, "remove_last_n_layers": remove_last_n_layers, "routed_experts": target.routed_experts, "top_k": target.routed_top_k},
         "depth": {"method": "last_layers", "kept_block_indices": keep_blocks},
         "width": {"method": "rmsnorm_mean_abs", "hidden_keep_indices": keep_idx, "hidden_size_before": current_hidden, "hidden_size_after": target.hidden_size},
         "experts": {"method": cfg.compression.experts.method, "importance_metric": cfg.compression.experts.importance_metric, "similarity_metric": cfg.compression.experts.similarity_metric, "layers": expert_layers},
