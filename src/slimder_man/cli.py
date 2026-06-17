@@ -29,6 +29,7 @@ from slimder_man.quant.fake_backend import fake_quantize_tiny_model
 from slimder_man.ui.app import create_app
 from slimder_man.utils.hashing import sha256_file
 from slimder_man.utils.json import write_json
+from slimder_man.utils.determinism import set_seed
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -145,6 +146,7 @@ def init_config(out: Path = Path("config.yaml"), json_output: bool = typer.Optio
 @app.command()
 def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    set_seed(cfg.project.seed)
     model = _load_model(cfg)
     arch = describe_model(model)
     tokenizer = _load_tokenizer(cfg)
@@ -165,6 +167,7 @@ def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> 
 @app.command(name="recommend")
 def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "balanced_50", json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    set_seed(cfg.project.seed)
     model = _load_model(cfg)
     recs = recommend(describe_model(model), preset)
     _echo({"preset": preset, "candidates": recs}, json_output)
@@ -172,6 +175,7 @@ def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "b
 @app.command()
 def compress(config: Path, stage: int = 1, json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    set_seed(cfg.project.seed)
     out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     teacher = _load_model(cfg)
     arch = describe_model(teacher)
@@ -190,6 +194,7 @@ def compress(config: Path, stage: int = 1, json_output: bool = typer.Option(Fals
 @app.command()
 def distill(config: Path, stage: int = 1, resume: bool = False, json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    set_seed(cfg.project.seed)
     ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     if cfg.teacher.load_mode == "tiny":
         teacher = _tiny_teacher(cfg)
@@ -214,6 +219,7 @@ def distill(config: Path, stage: int = 1, resume: bool = False, json_output: boo
 @app.command()
 def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    set_seed(cfg.project.seed)
     if dry_run:
         _echo(_dry_run_plan(cfg), json_output)
         return
@@ -239,8 +245,9 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
 
 @app.command()
 def eval(checkpoint: Path, tasks: str = "", json_output: bool = typer.Option(False, "--json")) -> None:
-    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
     cfg = tiny_default_config()
+    set_seed(cfg.project.seed)
+    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
     batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
     _echo({"perplexity": tiny_perplexity(model, batches[:8]), "tasks": [x for x in tasks.split(",") if x]}, json_output)
 
@@ -248,6 +255,7 @@ def eval(checkpoint: Path, tasks: str = "", json_output: bool = typer.Option(Fal
 @app.command()
 def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = load_config(config)
+    set_seed(cfg.project.seed)
     if cfg.project.paper_faithful:
         raise typer.BadParameter("paper_faithful mode rejects quantization")
     if cfg.teacher.load_mode != "tiny":

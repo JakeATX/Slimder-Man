@@ -121,36 +121,40 @@ class TinyOutput:
 class TinyMoEForCausalLM(nn.Module):
     def __init__(self, config: TinyConfig | None = None):
         super().__init__()
+        rng_state = torch.get_rng_state()
         self.config = config or TinyConfig()
         cfg = self.config
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList([
-            TinyBlock(
-                cfg.hidden_size,
-                cfg.block_pattern[i % len(cfg.block_pattern)],
-                cfg.num_routed_experts,
-                cfg.top_k,
-                cfg.num_shared_experts,
-                cfg.expert_intermediate_size,
-            )
-            for i in range(cfg.num_layers)
-        ])
-        self.norm = TinyRMSNorm(cfg.hidden_size)
-        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        if cfg.tie_embeddings:
-            self.lm_head.weight = self.embed_tokens.weight
-        self.mtp_heads = nn.ModuleList([nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False) for _ in range(cfg.mtp_depths)])
-        self._init_deterministic()
+        try:
+            self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+            self.layers = nn.ModuleList([
+                TinyBlock(
+                    cfg.hidden_size,
+                    cfg.block_pattern[i % len(cfg.block_pattern)],
+                    cfg.num_routed_experts,
+                    cfg.top_k,
+                    cfg.num_shared_experts,
+                    cfg.expert_intermediate_size,
+                )
+                for i in range(cfg.num_layers)
+            ])
+            self.norm = TinyRMSNorm(cfg.hidden_size)
+            self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+            if cfg.tie_embeddings:
+                self.lm_head.weight = self.embed_tokens.weight
+            self.mtp_heads = nn.ModuleList([nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False) for _ in range(cfg.mtp_depths)])
+            self._init_deterministic()
+        finally:
+            torch.set_rng_state(rng_state)
 
     def _init_deterministic(self) -> None:
-        torch.manual_seed(123)
+        generator = torch.Generator(device="cpu").manual_seed(123)
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                module.weight.data.normal_(mean=0.0, std=0.02, generator=generator)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                module.weight.data.normal_(mean=0.0, std=0.02, generator=generator)
 
     def forward(self, input_ids: torch.Tensor, labels: torch.Tensor | None = None) -> TinyOutput:
         x = self.embed_tokens(input_ids)
@@ -187,7 +191,7 @@ class TinyMoEForCausalLM(nn.Module):
         data = json.loads((path / "config.json").read_text(encoding="utf-8"))
         data["block_pattern"] = tuple(data["block_pattern"])
         model = cls(TinyConfig(**data))
-        model.load_state_dict(torch.load(path / "model.pt", map_location="cpu"))
+        model.load_state_dict(torch.load(path / "model.pt", map_location="cpu", weights_only=True))
         return model
 
 

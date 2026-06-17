@@ -12,6 +12,7 @@ from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig
 from slimder_man.distill.losses import total_distill_loss
 from slimder_man.distill.schedules import cosine_schedule, global_cosine_lr, linear_schedule
+from slimder_man.utils.determinism import set_seed
 
 
 def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM, cfg: SlimderConfig, output_dir: str | Path, resume: bool = False) -> dict:
@@ -21,6 +22,8 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
     resume_model_dir = out_dir / "resume_model"
     start_step = 0
     logs = []
+    if not resume:
+        set_seed(cfg.project.seed)
     if resume and state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
         start_step = state.get("global_step", 0)
@@ -35,7 +38,7 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.training.learning_rate)
     opt_path = out_dir / "optimizer.pt"
     if resume and opt_path.exists():
-        opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
+        opt.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
     total_steps = cfg.training.train_steps
     teacher.eval()
     student.train()
@@ -113,6 +116,8 @@ def train_causal_lm_distill(
     state_path = out_dir / "trainer_state.json"
     start_step = 0
     logs = []
+    if not resume:
+        set_seed(cfg.project.seed)
     if resume and state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
         start_step = state.get("global_step", 0)
@@ -127,7 +132,7 @@ def train_causal_lm_distill(
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.training.learning_rate)
     opt_path = out_dir / "optimizer.pt"
     if resume and opt_path.exists():
-        opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
+        opt.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
 
     total_steps = cfg.training.train_steps
     teacher.eval()
