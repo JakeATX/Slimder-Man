@@ -25,6 +25,7 @@ from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_d
 from slimder_man.eval.perplexity import tiny_perplexity
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
+from slimder_man.quant.fake_backend import fake_quantize_tiny_model
 from slimder_man.ui.app import create_app
 from slimder_man.utils.hashing import sha256_file
 from slimder_man.utils.json import write_json
@@ -249,20 +250,29 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
     cfg = load_config(config)
     if cfg.project.paper_faithful:
         raise typer.BadParameter("paper_faithful mode rejects quantization")
+    if cfg.teacher.load_mode != "tiny":
+        raise typer.BadParameter("Only the fake tiny quantization backend is implemented; HF AWQ/GPTQ/SmoothQuant/bnb adapters remain explicit future backends.")
     out_dir = Path(cfg.project.output_dir) / "quantized"
     out_dir.mkdir(parents=True, exist_ok=True)
     model = TinyMoEForCausalLM.from_pretrained(checkpoint)
-    model.save_pretrained(out_dir)
+    target_bits = cfg.quantization.target_avg_bits or 8.0
+    fake_manifest = fake_quantize_tiny_model(model, out_dir, target_avg_bits=target_bits)
+    artifact_hashes = {
+        name: sha256_file(out_dir / name)
+        for name in ("model.pt", "config.json", "fake_quant_manifest.json")
+        if (out_dir / name).exists()
+    }
     manifest = {
         "mode": cfg.quantization.mode,
+        "backend": fake_manifest["backend"],
         "source_checkpoint": str(checkpoint),
-        "target_avg_bits": cfg.quantization.target_avg_bits,
-        "artifact_hashes": {
-            name: sha256_file(out_dir / name)
-            for name in ("model.pt", "config.json")
-            if (out_dir / name).exists()
-        },
-        "note": "export-only augmented quantization artifact; structural fake quant backends are available through quant modules",
+        "target_avg_bits": target_bits,
+        "allocation": fake_manifest["allocation"],
+        "validation": fake_manifest["validation"],
+        "protected_modules": ["router", "norm", "embed_tokens", "lm_head", "shared"],
+        "fake_quant_manifest": "fake_quant_manifest.json",
+        "artifact_hashes": artifact_hashes,
+        "note": fake_manifest["note"],
     }
     write_json(out_dir / "quantization_manifest.json", manifest)
     _echo({"checkpoint": str(checkpoint), "out": str(out_dir), "manifest": manifest}, json_output)

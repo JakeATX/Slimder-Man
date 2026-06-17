@@ -8,6 +8,7 @@ import torch
 
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.quant.bit_allocator import QuantItem, allocate_bits
+from slimder_man.utils.hashing import sha256_file
 from slimder_man.utils.json import write_json
 
 
@@ -48,13 +49,29 @@ def fake_quantize_tiny_model(
     with torch.no_grad():
         for name, param in quantized.named_parameters():
             param.copy_(fake_quantize_tensor(param, allocation[name]))
+    validation_input = torch.arange(0, min(8, model.config.vocab_size), dtype=torch.long).unsqueeze(0) % model.config.vocab_size
+    with torch.no_grad():
+        validation_out = quantized(validation_input, labels=validation_input)
+    if validation_out.loss is None or not torch.isfinite(validation_out.loss):
+        raise ValueError("Fake quantized model failed finite-loss validation")
     out = Path(output_dir)
     quantized.save_pretrained(out)
+    artifact_hashes = {
+        name: sha256_file(out / name)
+        for name in ("model.pt", "config.json")
+        if (out / name).exists()
+    }
     manifest = {
         "backend": "fake_symmetric_uniform",
         "target_avg_bits": target_avg_bits,
         "allowed_bits": bits,
         "allocation": allocation,
+        "artifact_hashes": artifact_hashes,
+        "validation": {
+            "finite_loss": True,
+            "loss": float(validation_out.loss.detach().cpu()),
+            "logits_shape": list(validation_out.logits.shape),
+        },
         "note": "Fake quantization stores dequantized tensors for runtime smoke tests; it is not a packed production format.",
     }
     write_json(out / "fake_quant_manifest.json", manifest)

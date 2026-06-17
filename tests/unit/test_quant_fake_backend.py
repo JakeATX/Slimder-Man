@@ -21,5 +21,7 @@ def test_fake_quant_backend_writes_loadable_tiny_artifact(tmp_path):
     assert (tmp_path / "fake_quant_manifest.json").exists()
     assert manifest == read_json(tmp_path / "fake_quant_manifest.json")
     assert "embed_tokens.weight" in manifest["allocation"]
+    assert manifest["validation"]["finite_loss"] is True
+    assert manifest["validation"]["logits_shape"] == [1, 8, model.config.vocab_size]
     loaded = TinyMoEForCausalLM.from_pretrained(tmp_path)
     assert sum(p.numel() for p in loaded.parameters()) == sum(p.numel() for p in model.parameters())
