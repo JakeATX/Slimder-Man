@@ -20,8 +20,11 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
     state_path = out_dir / "trainer_state.json"
     resume_model_dir = out_dir / "resume_model"
     start_step = 0
+    logs = []
     if resume and state_path.exists():
-        start_step = json.loads(state_path.read_text(encoding="utf-8")).get("global_step", 0)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        start_step = state.get("global_step", 0)
+        logs = list(state.get("logs", []))
         rng_path = out_dir / "rng_state.pt"
         if rng_path.exists():
             rng = torch.load(rng_path, map_location="cpu", weights_only=False)
@@ -34,7 +37,6 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
     if resume and opt_path.exists():
         opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
     total_steps = cfg.training.train_steps
-    logs = []
     teacher.eval()
     student.train()
     for step in range(start_step, total_steps):
@@ -76,7 +78,17 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
             out_dir / "rng_state.pt",
         )
         state_path.write_text(
-            json.dumps({"global_step": step + 1, "logs": logs, "config": cfg.model_dump(mode="json"), "optimizer_state": str(opt_path)}, indent=2),
+            json.dumps(
+                {
+                    "global_step": step + 1,
+                    "logs": logs,
+                    "config": cfg.model_dump(mode="json"),
+                    "optimizer_state": str(opt_path),
+                    "rng_state": str(out_dir / "rng_state.pt"),
+                    "dataloader_position": (step + 1) % len(batches),
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
     student.save_pretrained(out_dir / "final")
@@ -100,8 +112,17 @@ def train_causal_lm_distill(
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "trainer_state.json"
     start_step = 0
+    logs = []
     if resume and state_path.exists():
-        start_step = json.loads(state_path.read_text(encoding="utf-8")).get("global_step", 0)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        start_step = state.get("global_step", 0)
+        logs = list(state.get("logs", []))
+        rng_path = out_dir / "rng_state.pt"
+        if rng_path.exists():
+            rng = torch.load(rng_path, map_location="cpu", weights_only=False)
+            torch.set_rng_state(rng["torch_rng_state"])
+            random.setstate(rng["python_random_state"])
+            np.random.set_state(rng["numpy_random_state"])
 
     opt = torch.optim.AdamW(student.parameters(), lr=cfg.training.learning_rate)
     opt_path = out_dir / "optimizer.pt"
@@ -109,7 +130,6 @@ def train_causal_lm_distill(
         opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
 
     total_steps = cfg.training.train_steps
-    logs = []
     teacher.eval()
     student.train()
     for step in range(start_step, total_steps):
@@ -143,8 +163,26 @@ def train_causal_lm_distill(
         torch.save(opt.state_dict(), opt_path)
         if hasattr(student, "save_pretrained"):
             student.save_pretrained(out_dir / "resume_model")
+        torch.save(
+            {
+                "torch_rng_state": torch.get_rng_state(),
+                "python_random_state": random.getstate(),
+                "numpy_random_state": np.random.get_state(),
+            },
+            out_dir / "rng_state.pt",
+        )
         state_path.write_text(
-            json.dumps({"global_step": step + 1, "logs": logs, "config": cfg.model_dump(mode="json"), "optimizer_state": str(opt_path)}, indent=2),
+            json.dumps(
+                {
+                    "global_step": step + 1,
+                    "logs": logs,
+                    "config": cfg.model_dump(mode="json"),
+                    "optimizer_state": str(opt_path),
+                    "rng_state": str(out_dir / "rng_state.pt"),
+                    "dataloader_position": (step + 1) % len(batches),
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
 

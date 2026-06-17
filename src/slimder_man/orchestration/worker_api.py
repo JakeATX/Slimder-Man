@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from slimder_man.orchestration.worker_runtime import WorkerJobRequest, WorkerJobStore
 
-class JobRequest(BaseModel):
-    config_path: str | None = None
-    command: str = "run"
+
+class JobRequest(WorkerJobRequest):
+    pass
 
 
 class TensorRequest(BaseModel):
     input_ids: list[list[int]]
 
 
-def create_worker_app(model_id_or_path: str | None = None) -> FastAPI:
+def create_worker_app(model_id_or_path: str | None = None, job_root: str | Path | None = None) -> FastAPI:
     app = FastAPI(title="Slimder Man Worker")
-    jobs: dict[str, dict] = {}
+    jobs = WorkerJobStore(job_root)
     teacher = None
     if model_id_or_path:
         from transformers import AutoModelForCausalLM
@@ -36,22 +39,20 @@ def create_worker_app(model_id_or_path: str | None = None) -> FastAPI:
 
     @app.post("/v1/jobs")
     def create_job(req: JobRequest):
-        job_id = str(len(jobs) + 1)
-        jobs[job_id] = {"id": job_id, "status": "queued", "request": req.model_dump()}
-        return jobs[job_id]
+        job = jobs.create(req)
+        return jobs.start(job["id"])
 
     @app.get("/v1/jobs/{job_id}")
     def get_job(job_id: str):
-        return jobs.get(job_id, {"id": job_id, "status": "missing"})
+        return jobs.get(job_id)
 
     @app.get("/v1/jobs/{job_id}/logs")
     def logs(job_id: str):
-        return {"id": job_id, "logs": []}
+        return jobs.logs(job_id)
 
     @app.post("/v1/jobs/{job_id}/stop")
     def stop(job_id: str):
-        jobs.setdefault(job_id, {"id": job_id})["status"] = "stopped"
-        return jobs[job_id]
+        return jobs.stop(job_id)
 
     @app.post("/v1/teacher_logits")
     def teacher_logits(req: TensorRequest):
