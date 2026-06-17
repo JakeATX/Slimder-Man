@@ -23,7 +23,7 @@ from slimder_man.config.defaults import tiny_default_config
 from slimder_man.config.schema import SlimderConfig, load_config, save_config
 from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_distill
 from slimder_man.distill.stage_runner import run_tiny_progressive_stages
-from slimder_man.eval.perplexity import tiny_perplexity
+from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
 from slimder_man.quant.fake_backend import fake_quantize_tiny_model
@@ -44,6 +44,17 @@ def _echo(data: dict, as_json: bool) -> None:
 
 def _load_or_default(path: Optional[Path]) -> SlimderConfig:
     return load_config(path) if path else tiny_default_config()
+
+
+def _load_cli_config(path: Path) -> SlimderConfig:
+    cfg = load_config(path)
+    dataset_path = cfg.calibration.dataset.path
+    if dataset_path:
+        raw_path = Path(dataset_path)
+        candidate = (path.parent / raw_path).resolve()
+        if not raw_path.is_absolute() and candidate.exists():
+            cfg.calibration.dataset.path = str(candidate)
+    return cfg
 
 
 def _resolve_config_path(config: Path | None, config_option: Path | None = None) -> Path:
@@ -165,7 +176,7 @@ def init_config(out: Path = Path("config.yaml"), json_output: bool = typer.Optio
 
 @app.command()
 def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
-    cfg = load_config(config)
+    cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
     model = _load_model(cfg)
     arch = describe_model(model)
@@ -186,7 +197,7 @@ def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> 
 
 @app.command(name="recommend")
 def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "balanced_50", json_output: bool = typer.Option(False, "--json")) -> None:
-    cfg = load_config(config)
+    cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
     model = _load_model(cfg)
     recs = recommend(describe_model(model), preset)
@@ -199,7 +210,7 @@ def compress(
     stage: int = 1,
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    cfg = load_config(_resolve_config_path(config, config_option))
+    cfg = _load_cli_config(_resolve_config_path(config, config_option))
     set_seed(cfg.project.seed)
     out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     teacher = _load_model(cfg)
@@ -218,7 +229,7 @@ def compress(
 
 @app.command()
 def distill(config: Path, stage: int = 1, resume: bool = False, json_output: bool = typer.Option(False, "--json")) -> None:
-    cfg = load_config(config)
+    cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
     ckpt = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     if cfg.teacher.load_mode == "tiny":
@@ -243,13 +254,47 @@ def distill(config: Path, stage: int = 1, resume: bool = False, json_output: boo
 
 @app.command()
 def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_output: bool = typer.Option(False, "--json")) -> None:
-    cfg = load_config(config)
+    cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
     if dry_run:
         _echo(_dry_run_plan(cfg), json_output)
         return
     if cfg.teacher.load_mode != "tiny":
-        raise typer.BadParameter("Use --dry-run for full-model orchestration checks, then run analyze/compress/distill stages explicitly on provisioned hardware.")
+        if cfg.teacher.model_id_or_path != "dummy-hf-moe":
+            raise typer.BadParameter(
+                "Full local run is currently enabled only for the bundled dummy-hf-moe smoke fixture; "
+                "use --dry-run plus explicit analyze/compress/distill or launch remote orchestration for real checkpoints."
+            )
+        teacher = _load_model(cfg)
+        arch = describe_model(teacher)
+        tokenizer = _load_tokenizer(cfg)
+        batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+        adapter = get_adapter(teacher)
+        cal = collect_calibration(teacher, batches, adapter)
+        out_dir = Path(cfg.project.output_dir)
+        analysis_dir = out_dir / "analysis"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        recs = recommend(arch, cfg.compression.preset)
+        write_json(analysis_dir / "architecture.json", arch)
+        calibration_manifest = write_calibration_artifacts(analysis_dir, cfg, cal, cal_manifest, arch)
+        write_analysis_report(analysis_dir / "analysis_report.md", arch, recs)
+        ckpt_dir = out_dir / "checkpoints" / "stage_1_compressed"
+        student, manifest = compress_model(teacher, cfg, cal, adapter=adapter, output_dir=ckpt_dir, tokenizer=tokenizer)
+        train = train_causal_lm_distill(teacher, student, cfg, out_dir / "training", batches, resume=False)
+        eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
+        ppl = causal_lm_perplexity(student, eval_batches[:8])
+        result = {
+            "analysis": str(analysis_dir),
+            "calibration_manifest": calibration_manifest,
+            "checkpoint": str(ckpt_dir),
+            "manifest": manifest,
+            "training": train,
+            "perplexity": ppl,
+            "recommendations": recs,
+        }
+        write_json(out_dir / "run_summary.json", result)
+        _echo(result, json_output)
+        return
     teacher = _tiny_teacher(cfg)
     arch = describe_model(teacher)
     batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)

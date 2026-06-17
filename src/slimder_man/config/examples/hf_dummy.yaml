@@ -15,7 +15,8 @@ student:
   tie_embeddings: auto
 calibration:
   dataset:
-    type: synthetic
+    type: text
+    path: hf_dummy_calibration.txt
     split: train
     text_field: text
   sample_count: 2
