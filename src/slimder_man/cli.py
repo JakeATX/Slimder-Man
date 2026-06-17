@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
 import typer
+import torch
 from rich import print
 
 from slimder_man.adapters.registry import get_adapter
@@ -16,7 +18,7 @@ from slimder_man.analyze.reports import write_analysis_report
 from slimder_man.calibration.artifacts import write_calibration_artifacts
 from slimder_man.calibration.collectors import collect_calibration, collect_tiny_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
-from slimder_man.compression.apply import compress_model, compress_tiny_model
+from slimder_man.compression.apply import TOKENIZER_ARTIFACT_NAMES, compress_model, compress_tiny_model
 from slimder_man.compression.manifests import load_manifest
 from slimder_man.compression.validate import validate_tiny_model
 from slimder_man.config.defaults import tiny_default_config
@@ -61,6 +63,13 @@ def _resolve_config_path(config: Path | None, config_option: Path | None = None)
     resolved = config_option or config
     if resolved is None:
         raise typer.BadParameter("A config path is required")
+    return resolved
+
+
+def _resolve_path_arg(value: Path | None, option: Path | None, label: str) -> Path:
+    resolved = option or value
+    if resolved is None:
+        raise typer.BadParameter(f"{label} path is required")
     return resolved
 
 
@@ -125,6 +134,93 @@ def _load_model(cfg: SlimderConfig):
 
 def _load_tokenizer(cfg: SlimderConfig):
     return None if cfg.teacher.load_mode == "tiny" else _load_transformers_tokenizer(cfg)
+
+
+def _checkpoint_kind(checkpoint: Path) -> str:
+    if (checkpoint / "model.pt").exists():
+        return "tiny"
+    config_path = checkpoint / "config.json"
+    if not config_path.exists():
+        raise ValueError(f"Checkpoint is missing config.json: {checkpoint}")
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Checkpoint config.json is not valid JSON: {checkpoint}") from exc
+    if config.get("model_type") == "dummy_hf_moe":
+        return "dummy_hf_moe"
+    if any((checkpoint / name).exists() for name in ("model.safetensors", "pytorch_model.bin")) or any(checkpoint.glob("model-*.safetensors")):
+        return "transformers"
+    raise ValueError(f"Unsupported checkpoint format: {checkpoint}")
+
+
+def _load_checkpoint_auto(checkpoint: Path):
+    kind = _checkpoint_kind(checkpoint)
+    if kind == "tiny":
+        return TinyMoEForCausalLM.from_pretrained(checkpoint), kind
+    if kind == "dummy_hf_moe":
+        from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM
+
+        return DummyHfMoeForCausalLM.from_pretrained(checkpoint), kind
+    from transformers import AutoModelForCausalLM
+
+    return AutoModelForCausalLM.from_pretrained(checkpoint, trust_remote_code=True), kind
+
+
+def _save_checkpoint_auto(model, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if isinstance(model, TinyMoEForCausalLM):
+        model.save_pretrained(output_dir)
+        return
+    if not hasattr(model, "save_pretrained"):
+        raise ValueError("Loaded checkpoint model does not expose save_pretrained")
+    try:
+        model.save_pretrained(output_dir, safe_serialization=True)
+    except TypeError:
+        model.save_pretrained(output_dir)
+
+
+def _copy_checkpoint_sidecars(source: Path, out: Path) -> dict[str, str]:
+    copied: dict[str, str] = {}
+    names = set(TOKENIZER_ARTIFACT_NAMES) | {"compression_manifest.json"}
+    for path in source.rglob("*"):
+        if not path.is_file() or path.name not in names:
+            continue
+        rel = path.relative_to(source)
+        target = out / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if path.resolve() != target.resolve():
+            shutil.copy2(path, target)
+        copied[rel.as_posix()] = sha256_file(target)
+    return copied
+
+
+def _forward_validation_errors(model, kind: str) -> list[str]:
+    errors: list[str] = []
+    try:
+        arch = describe_model(model)
+        vocab_size = int(arch["vocab_size"])
+        input_ids = sample_calibration_tokens(
+            SlimderConfig(calibration={"sample_count": 1, "sequence_length": 8}).calibration,
+            vocab_size=vocab_size,
+        )[0][0]
+        with torch.no_grad():
+            out = model(input_ids, labels=input_ids) if kind == "tiny" else model(input_ids=input_ids, labels=input_ids)
+        logits = out.logits
+        if any(dim <= 0 for dim in logits.shape):
+            errors.append("logits contain a zero dimension")
+        if not torch.isfinite(logits).all():
+            errors.append("logits are not finite")
+        if out.loss is None:
+            errors.append("loss is missing")
+        elif not torch.isfinite(out.loss):
+            errors.append("loss is not finite")
+        for name, tensor in model.state_dict().items():
+            if any(dim <= 0 for dim in tensor.shape):
+                errors.append(f"tensor has zero dimension: {name}")
+                break
+    except Exception as exc:
+        errors.append(str(exc))
+    return errors
 
 
 def _dry_run_plan(cfg: SlimderConfig) -> dict:
@@ -330,12 +426,20 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
 
 
 @app.command()
-def eval(checkpoint: Path, tasks: str = "", json_output: bool = typer.Option(False, "--json")) -> None:
+def eval(
+    checkpoint: Path | None = typer.Argument(None),
+    checkpoint_option: Path | None = typer.Option(None, "--checkpoint"),
+    tasks: str = "",
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    checkpoint = _resolve_path_arg(checkpoint, checkpoint_option, "checkpoint")
     cfg = tiny_default_config()
     set_seed(cfg.project.seed)
-    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
-    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
-    _echo({"perplexity": tiny_perplexity(model, batches[:8]), "tasks": [x for x in tasks.split(",") if x]}, json_output)
+    model, kind = _load_checkpoint_auto(checkpoint)
+    arch = describe_model(model)
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"])
+    perplexity = tiny_perplexity(model, batches[:8]) if kind == "tiny" else causal_lm_perplexity(model, batches[:8])
+    _echo({"checkpoint": str(checkpoint), "kind": kind, "perplexity": perplexity, "tasks": [x for x in tasks.split(",") if x]}, json_output)
 
 
 @app.command()
@@ -403,20 +507,45 @@ def worker(
 
 
 @app.command("consolidate-checkpoint")
-def consolidate_checkpoint(checkpoint: Path, out: Path, json_output: bool = typer.Option(False, "--json")) -> None:
-    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
-    model.save_pretrained(out)
-    _echo({"checkpoint": str(checkpoint), "out": str(out)}, json_output)
+def consolidate_checkpoint(
+    checkpoint: Path | None = typer.Argument(None),
+    out: Path | None = typer.Argument(None),
+    checkpoint_option: Path | None = typer.Option(None, "--checkpoint"),
+    out_option: Path | None = typer.Option(None, "--out"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    checkpoint = _resolve_path_arg(checkpoint, checkpoint_option, "checkpoint")
+    out = _resolve_path_arg(out, out_option, "out")
+    model, kind = _load_checkpoint_auto(checkpoint)
+    _save_checkpoint_auto(model, out)
+    sidecar_hashes = _copy_checkpoint_sidecars(checkpoint, out)
+    artifact_hashes = {
+        path.relative_to(out).as_posix(): sha256_file(path)
+        for path in out.rglob("*")
+        if path.is_file() and path.name in {"model.pt", "model.safetensors", "pytorch_model.bin", "config.json"}
+    }
+    artifact_hashes.update(sidecar_hashes)
+    _echo({"checkpoint": str(checkpoint), "out": str(out), "kind": kind, "artifact_hashes": artifact_hashes}, json_output)
 
 
 @app.command("validate-checkpoint")
-def validate_checkpoint(checkpoint: Path, json_output: bool = typer.Option(False, "--json")) -> None:
-    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
-    errors = validate_tiny_model(model)
+def validate_checkpoint(
+    checkpoint: Path | None = typer.Argument(None),
+    checkpoint_option: Path | None = typer.Option(None, "--checkpoint"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    checkpoint = _resolve_path_arg(checkpoint, checkpoint_option, "checkpoint")
+    model, kind = _load_checkpoint_auto(checkpoint)
+    errors = validate_tiny_model(model) if kind == "tiny" else []
+    errors.extend(_forward_validation_errors(model, kind))
     manifest = checkpoint / "compression_manifest.json"
+    manifest_data = None
     if manifest.exists():
-        load_manifest(manifest)
-    _echo({"checkpoint": str(checkpoint), "valid": not errors, "errors": errors}, json_output)
+        try:
+            manifest_data = load_manifest(manifest)
+        except Exception as exc:
+            errors.append(f"compression manifest invalid: {exc}")
+    _echo({"checkpoint": str(checkpoint), "kind": kind, "valid": not errors, "errors": errors, "manifest": manifest_data}, json_output)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,46 @@ def test_run_executes_checked_in_hf_dummy_pipeline_without_monkeypatch(tmp_path:
         assert math.isfinite(final_ppl) and final_ppl > 0
 
 
+def test_checkpoint_commands_support_hf_dummy_outputs(tmp_path: Path):
+    config_path = Path("src/slimder_man/config/examples/hf_dummy.yaml").resolve()
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        run_result = runner.invoke(app, ["run", str(config_path), "--json"])
+        assert run_result.exit_code == 0, run_result.output
+
+        run_dir = Path("runs/hf_dummy_moe_smoke")
+        compressed = run_dir / "checkpoints" / "stage_1_compressed"
+        final = run_dir / "training" / "final"
+        eval_result = runner.invoke(app, ["eval", "--checkpoint", str(final), "--json"])
+        assert eval_result.exit_code == 0, eval_result.output
+        eval_payload = json.loads(eval_result.output)
+        assert eval_payload["kind"] == "dummy_hf_moe"
+        assert math.isfinite(eval_payload["perplexity"]) and eval_payload["perplexity"] > 0
+
+        validate_result = runner.invoke(app, ["validate-checkpoint", "--checkpoint", str(compressed), "--json"])
+        assert validate_result.exit_code == 0, validate_result.output
+        validate_payload = json.loads(validate_result.output)
+        assert validate_payload["kind"] == "dummy_hf_moe"
+        assert validate_payload["valid"] is True
+        assert validate_payload["errors"] == []
+        assert validate_payload["manifest"]["teacher_model"] == "dummy-hf-moe"
+
+        consolidated = Path("consolidated_hf")
+        consolidate_result = runner.invoke(app, ["consolidate-checkpoint", "--checkpoint", str(compressed), "--out", str(consolidated), "--json"])
+        assert consolidate_result.exit_code == 0, consolidate_result.output
+        consolidate_payload = json.loads(consolidate_result.output)
+        assert consolidate_payload["kind"] == "dummy_hf_moe"
+        assert (consolidated / "model.safetensors").exists()
+        assert (consolidated / "config.json").exists()
+        assert (consolidated / "tokenizer_config.json").exists()
+        assert (consolidated / "compression_manifest.json").exists()
+        assert consolidate_payload["artifact_hashes"]["model.safetensors"] == sha256_file(consolidated / "model.safetensors")
+        assert consolidate_payload["artifact_hashes"]["tokenizer_config.json"] == sha256_file(consolidated / "tokenizer_config.json")
+        reloaded = DummyHfMoeForCausalLM.from_pretrained(consolidated)
+        batches, _ = sample_calibration_tokens(SlimderConfig(calibration={"sample_count": 1, "sequence_length": 8}).calibration, vocab_size=reloaded.config.vocab_size)
+        assert causal_lm_perplexity(reloaded, batches) > 0
+
+
 def test_run_rejects_non_dummy_transformers_without_local_preflight(monkeypatch, tmp_path: Path):
     from slimder_man import cli
 
