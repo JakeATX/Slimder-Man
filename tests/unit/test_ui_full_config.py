@@ -1,7 +1,8 @@
+import json
 import yaml
 
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.ui.app import build_config_yaml
+from slimder_man.ui.app import build_config_yaml, run_cli_with_yaml, run_ui_command
 
 
 def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
@@ -61,3 +62,78 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
     assert cfg.runtime.skypilot.accelerators == "A100:4"
     assert cfg.runtime.skypilot.cloud == "aws"
     assert cfg.runtime.tracking.backend == "none"
+
+
+def test_ui_helpers_run_tiny_analyze_recommend_and_run(tmp_path):
+    yaml_text = build_config_yaml(
+        project_name="ui_tiny",
+        sample_count=4,
+        sequence_length=8,
+        token_budget=32,
+        train_steps=1,
+        output_dir=str(tmp_path / "ui_tiny"),
+    )
+
+    analyze = json.loads(run_cli_with_yaml(yaml_text, "analyze"))
+    recommend = json.loads(run_cli_with_yaml(yaml_text, "recommend", preset="balanced_50"))
+    run = json.loads(run_cli_with_yaml(yaml_text, "run"))
+
+    assert analyze["analysis_dir"] == str(tmp_path / "ui_tiny" / "analysis")
+    assert recommend["preset"] == "balanced_50"
+    assert recommend["candidates"]
+    assert run["perplexity"] > 0
+    assert (tmp_path / "ui_tiny" / "run_summary.json").exists()
+
+
+def test_ui_command_uses_current_fields_without_generated_yaml(monkeypatch):
+    captured = {}
+
+    def fake_run(yaml_text: str, command: str, preset: str = "balanced_50") -> str:
+        captured["yaml"] = yaml_text
+        captured["command"] = command
+        captured["preset"] = preset
+        return "{}"
+
+    monkeypatch.setattr("slimder_man.ui.app.run_cli_with_yaml", fake_run)
+
+    result = run_ui_command(
+        "recommend",
+        "current_fields_project",
+        False,
+        True,
+        "tiny",
+        "tiny",
+        "float32",
+        "",
+        True,
+        "synthetic",
+        "",
+        "",
+        "train",
+        "text",
+        6,
+        7,
+        128,
+        1,
+        "local",
+        "auto",
+        "",
+        "",
+        22,
+        True,
+        "slimder",
+        "H100:8",
+        "auto",
+        "none",
+        preset="all",
+    )
+
+    cfg = SlimderConfig.model_validate(yaml.safe_load(captured["yaml"]))
+    assert result == "{}"
+    assert captured["command"] == "recommend"
+    assert captured["preset"] == "all"
+    assert cfg.project.name == "current_fields_project"
+    assert cfg.project.paper_faithful is False
+    assert cfg.quantization.enabled is True
+    assert cfg.calibration.sample_count == 6
+    assert cfg.calibration.sequence_length == 7
