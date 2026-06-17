@@ -78,4 +78,8 @@ def run_tiny_progressive_stages(
                 "manifest": manifest,
             }
         )
-    return {"stages": stages, "final_checkpoint": stages[-1]["checkpoint"] if stages else None}
+    return {
+        "stages": stages,
+        "final_checkpoint": stages[-1]["checkpoint"] if stages else None,
+        "final_training_checkpoint": stages[-1]["training"].get("checkpoint") if stages else None,
+    }

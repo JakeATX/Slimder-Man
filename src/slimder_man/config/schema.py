@@ -95,6 +95,12 @@ class ProgressiveConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_split(self) -> "ProgressiveConfig":
+        if self.stages not in {1, 2}:
+            raise ValueError("progressive.stages currently supports only 1 or 2 stages")
+        if self.schedule == "one_stage" and self.stages != 1:
+            raise ValueError("progressive.schedule=one_stage requires stages=1")
+        if self.stages == 2 and self.token_split == [1.0]:
+            self.token_split = [0.1, 0.9]
         if self.stages != len(self.token_split):
             raise ValueError("progressive.stages must match token_split length")
         if abs(sum(self.token_split) - 1.0) > 1e-6:

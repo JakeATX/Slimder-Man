@@ -22,6 +22,7 @@ from slimder_man.compression.validate import validate_tiny_model
 from slimder_man.config.defaults import tiny_default_config
 from slimder_man.config.schema import SlimderConfig, load_config, save_config
 from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_distill
+from slimder_man.distill.stage_runner import run_tiny_progressive_stages
 from slimder_man.eval.perplexity import tiny_perplexity
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
@@ -233,6 +234,22 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
     write_json(out_dir / "analysis" / "architecture.json", arch)
     write_calibration_artifacts(out_dir / "analysis", cfg, cal, cal_manifest, arch)
     write_analysis_report(out_dir / "analysis" / "analysis_report.md", arch, recommend(arch, cfg.compression.preset))
+    if cfg.progressive.stages > 1 or cfg.progressive.schedule != "one_stage":
+        progressive = run_tiny_progressive_stages(teacher, cfg, out_dir / "progressive")
+        final_train = Path(progressive["final_training_checkpoint"])
+        student = TinyMoEForCausalLM.from_pretrained(final_train)
+        eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+        ppl = tiny_perplexity(student, eval_batches[:8])
+        gen = student.generate(eval_batches[0][:, :2], max_new_tokens=8)
+        result = {
+            "analysis": str(out_dir / "analysis"),
+            "progressive": progressive,
+            "perplexity": ppl,
+            "generated_shape": list(gen.shape),
+        }
+        write_json(out_dir / "run_summary.json", result)
+        _echo(result, json_output)
+        return
     student, manifest = compress_tiny_model(teacher, cfg, cal, out_dir / "checkpoints" / "stage_1_compressed")
     train = train_tiny_distill(teacher, student, cfg, out_dir / "training", resume=False)
     eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
