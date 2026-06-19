@@ -5,6 +5,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from slimder_man.config.schema import SlimderConfig
 from slimder_man.config.defaults import tiny_default_config
 
 
@@ -37,6 +38,7 @@ def build_config_yaml(
     skypilot_cloud: str = "auto",
     tracking_backend: str = "tensorboard",
     output_dir: str | None = None,
+    compression_preset: str | None = None,
 ) -> str:
     import yaml
 
@@ -60,6 +62,8 @@ def build_config_yaml(
     cfg.training.token_budget = int(token_budget)
     cfg.training.sequence_length = int(sequence_length)
     cfg.training.train_steps = int(train_steps)
+    if compression_preset:
+        cfg.compression.preset = compression_preset
     cfg.runtime.backend = runtime_backend
     cfg.runtime.local.num_gpus = "auto" if local_num_gpus == "auto" else int(local_num_gpus)
     cfg.runtime.ssh.host = ssh_host or None
@@ -73,20 +77,110 @@ def build_config_yaml(
     return yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False)
 
 
-def run_cli_with_yaml(yaml_text: str, command: str, preset: str = "balanced_50") -> str:
+def _config_from_yaml(yaml_text: str) -> SlimderConfig:
+    import yaml
+
+    return SlimderConfig.model_validate(yaml.safe_load(yaml_text))
+
+
+def _json_or_error(proc: subprocess.CompletedProcess[str]) -> str:
+    return proc.stdout if proc.returncode == 0 else proc.stderr
+
+
+def run_cli_with_yaml(
+    yaml_text: str,
+    command: str,
+    preset: str = "balanced_50",
+    stage: int = 1,
+    backend: str = "local",
+    checkpoint: str | None = None,
+) -> str:
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "config.yaml"
         path.write_text(yaml_text, encoding="utf-8")
+        cfg = _config_from_yaml(yaml_text)
         if command == "recommend":
             argv = [sys.executable, "-m", "slimder_man.cli", "recommend", "--config", str(path), "--preset", preset, "--json"]
+        elif command == "compress":
+            argv = [sys.executable, "-m", "slimder_man.cli", "compress", "--config", str(path), "--stage", str(stage), "--json"]
+        elif command == "distill":
+            argv = [sys.executable, "-m", "slimder_man.cli", "distill", str(path), "--stage", str(stage), "--json"]
+        elif command == "eval":
+            ckpt = checkpoint or str(Path(cfg.project.output_dir) / "training" / "final")
+            argv = [sys.executable, "-m", "slimder_man.cli", "eval", "--checkpoint", ckpt, "--json"]
+        elif command == "launch":
+            argv = [sys.executable, "-m", "slimder_man.cli", "launch", str(path), "--backend", backend, "--json"]
         else:
             argv = [sys.executable, "-m", "slimder_man.cli", command, str(path), "--json"]
         proc = subprocess.run(argv, text=True, capture_output=True)
-        return proc.stdout if proc.returncode == 0 else proc.stderr
+        return _json_or_error(proc)
 
 
-def run_ui_command(command: str, *config_args, preset: str = "balanced_50") -> str:
-    return run_cli_with_yaml(build_config_yaml(*config_args), command, preset=preset)
+def run_ui_command(
+    command: str,
+    *config_args,
+    preset: str = "balanced_50",
+    stage: int = 1,
+    backend: str = "local",
+    checkpoint: str | None = None,
+    compression_preset: str | None = None,
+) -> str:
+    return run_cli_with_yaml(
+        build_config_yaml(*config_args, compression_preset=compression_preset),
+        command,
+        preset=preset,
+        stage=stage,
+        backend=backend,
+        checkpoint=checkpoint,
+    )
+
+
+def artifact_index(output_dir: str) -> str:
+    out = Path(output_dir or "runs/tiny_moe_cpu_smoke")
+    if not out.exists():
+        return f"No artifacts found under {out}"
+    rows = []
+    for path in sorted(out.rglob("*")):
+        if path.is_file() and path.name in {
+            "analysis_report.md",
+            "compression_manifest.json",
+            "training_report.md",
+            "run_summary.json",
+            "quantization_manifest.json",
+            "fake_quant_manifest.json",
+            "calibration_manifest.json",
+            "trainer_state.json",
+        }:
+            rows.append(str(path.resolve()))
+    return "\n".join(rows) if rows else f"No known Slimder artifacts found under {out}"
+
+
+def log_tail(output_dir: str, max_lines: int = 80) -> str:
+    out = Path(output_dir or "runs/tiny_moe_cpu_smoke")
+    candidates = [
+        out / "training" / "training_report.md",
+        out / "progressive" / "stage_1" / "training" / "training_report.md",
+        out / "progressive" / "stage_2" / "training" / "training_report.md",
+        out / "run_summary.json",
+    ]
+    lines: list[str] = []
+    for path in candidates:
+        if path.exists():
+            lines.append(f"# {path.resolve()}")
+            lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines()[-max_lines:])
+    return "\n".join(lines) if lines else f"No logs found under {out}"
+
+
+def config_warnings(yaml_text: str) -> str:
+    cfg = _config_from_yaml(yaml_text)
+    warnings: list[str] = []
+    if cfg.compression.preset in {"aggressive_80", "extreme_90"}:
+        warnings.append(f"{cfg.compression.preset} is high-risk and should be validated with staged evals.")
+    if not cfg.project.paper_faithful:
+        warnings.append("Non-paper-faithful mode enables augmented behavior; manifests should be reviewed for contamination.")
+    if cfg.teacher.load_mode == "transformers" and cfg.runtime.backend == "local" and not cfg.runtime.local.allow_full_model_run:
+        warnings.append("Arbitrary Transformers local run requires runtime.local.allow_full_model_run=true; use launch/dry-run for large checkpoints.")
+    return "\n".join(warnings) if warnings else "No warnings."
 
 
 def create_app(test_mode: bool = False):
@@ -101,6 +195,7 @@ def create_app(test_mode: bool = False):
         with gr.Tabs():
             with gr.Tab("Project"):
                 project = gr.Textbox(value="tiny_moe_cpu_smoke", label="Project name")
+                output_dir = gr.Textbox(value="runs/tiny_moe_cpu_smoke", label="Output directory")
                 faithful = gr.Checkbox(value=True, label="Paper faithful")
                 quant = gr.Checkbox(value=False, label="Augmented quantization", interactive=False)
             with gr.Tab("Teacher & Dataset"):
@@ -134,16 +229,34 @@ def create_app(test_mode: bool = False):
                 analyze_out = gr.Code(language="json", label="Analyze Output")
             with gr.Tab("Recommendations"):
                 preset = gr.Dropdown(["conservative_20", "balanced_50", "slimqwen_anchor", "aggressive_80", "extreme_90", "all"], value="balanced_50", label="Preset")
+                with gr.Row():
+                    conservative_btn = gr.Button("20 percent")
+                    balanced_btn = gr.Button("50 percent")
+                    anchor_btn = gr.Button("SlimQwen")
+                    aggressive_btn = gr.Button("80 percent")
+                    extreme_btn = gr.Button("90 percent")
                 recommend_btn = gr.Button("Generate Recommendations")
                 recommend_out = gr.Code(language="json", label="Recommendation Output")
             with gr.Tab("Compression"):
-                gr.Markdown("Compression runs as part of `slimder run` for the tiny smoke workflow.")
+                stage = gr.Number(value=1, precision=0, label="Stage")
+                compress_btn = gr.Button("Run Compression")
+                compress_out = gr.Code(language="json", label="Compression Output")
             with gr.Tab("Training / Distillation"):
-                gr.Markdown("Training logs are written to `training_report.md`.")
+                distill_btn = gr.Button("Run Distillation")
+                distill_out = gr.Code(language="json", label="Distillation Output")
+                logs_btn = gr.Button("Refresh Logs")
+                logs_out = gr.Textbox(lines=12, label="Logs")
             with gr.Tab("Evaluation"):
-                gr.Markdown("Perplexity summaries are written to `run_summary.json`.")
+                eval_checkpoint = gr.Textbox(value="runs/tiny_moe_cpu_smoke/training/final", label="Checkpoint")
+                eval_btn = gr.Button("Run Evaluation")
+                eval_out = gr.Code(language="json", label="Evaluation Output")
             with gr.Tab("Artifacts"):
-                gr.Markdown("Checkpoints, manifests, reports, and hashes are written under `project.output_dir`.")
+                launch_backend = gr.Dropdown(["local", "ssh", "skypilot"], value="local", label="Launch backend")
+                launch_btn = gr.Button("Launch / Dry Run")
+                launch_out = gr.Code(language="json", label="Launch Output")
+                artifacts_btn = gr.Button("Refresh Artifacts")
+                artifacts_out = gr.Textbox(lines=12, label="Artifacts")
+                warnings_out = gr.Textbox(value="No warnings.", lines=4, label="Warnings")
             output = gr.Code(value=build_config_yaml(), label="Generated YAML", language="yaml")
             btn = gr.Button("Generate Config")
             run_btn = gr.Button("Run Tiny Pipeline")
@@ -176,9 +289,118 @@ def create_app(test_mode: bool = False):
             sky_accelerators,
             sky_cloud,
             tracking,
+            output_dir,
         ]
-        btn.click(build_config_yaml, inputs=config_inputs, outputs=[output])
-        analyze_btn.click(lambda *args: run_ui_command("analyze", *args), inputs=config_inputs, outputs=[analyze_out])
-        recommend_btn.click(lambda selected, *args: run_ui_command("recommend", *args, preset=selected), inputs=[preset, *config_inputs], outputs=[recommend_out])
-        run_btn.click(lambda *args: run_ui_command("run", *args), inputs=config_inputs, outputs=[run_out])
+        # build_config_yaml keeps output_dir as the last optional argument.
+        def _build_from_ui(project_name, paper_faithful, quantization, teacher_model_id_or_path, teacher_load_mode, teacher_dtype, teacher_revision, trust_remote_code, dataset_type, dataset_name, dataset_path, dataset_split, text_field, sample_count, sequence_length, token_budget, train_steps, runtime_backend, local_num_gpus, ssh_host, ssh_user, ssh_port, ssh_dry_run, skypilot_cluster_name, skypilot_accelerators, skypilot_cloud, tracking_backend, output_dir_value, compression_preset):
+            return build_config_yaml(
+                project_name,
+                paper_faithful,
+                quantization,
+                teacher_model_id_or_path,
+                teacher_load_mode,
+                teacher_dtype,
+                teacher_revision,
+                trust_remote_code,
+                dataset_type,
+                dataset_name,
+                dataset_path,
+                dataset_split,
+                text_field,
+                sample_count,
+                sequence_length,
+                token_budget,
+                train_steps,
+                runtime_backend,
+                local_num_gpus,
+                ssh_host,
+                ssh_user,
+                ssh_port,
+                ssh_dry_run,
+                skypilot_cluster_name,
+                skypilot_accelerators,
+                skypilot_cloud,
+                tracking_backend,
+                output_dir_value,
+                compression_preset=compression_preset,
+            )
+
+        def _run_from_ui(command, *args, preset_value="balanced_50", stage_value=1, backend_value="local", checkpoint_value=None):
+            return run_cli_with_yaml(
+                _build_from_ui(*args, preset_value),
+                command,
+                preset=preset_value,
+                stage=int(stage_value),
+                backend=backend_value,
+                checkpoint=checkpoint_value,
+            )
+
+        config_inputs = [
+            project,
+            faithful,
+            quant,
+            teacher_model,
+            teacher_load,
+            teacher_dtype,
+            teacher_revision,
+            trust_remote,
+            dataset_type,
+            dataset_name,
+            dataset_path,
+            dataset_split,
+            text_field,
+            sample_count,
+            sequence_length,
+            token_budget,
+            train_steps,
+            runtime_backend,
+            local_gpus,
+            ssh_host,
+            ssh_user,
+            ssh_port,
+            ssh_dry,
+            sky_cluster,
+            sky_accelerators,
+            sky_cloud,
+            tracking,
+            output_dir,
+        ]
+        btn.click(_build_from_ui, inputs=[*config_inputs, preset], outputs=[output]).then(config_warnings, inputs=[output], outputs=[warnings_out])
+        for value, button in [
+            ("conservative_20", conservative_btn),
+            ("balanced_50", balanced_btn),
+            ("slimqwen_anchor", anchor_btn),
+            ("aggressive_80", aggressive_btn),
+            ("extreme_90", extreme_btn),
+        ]:
+            button.click(lambda selected=value: selected, outputs=[preset])
+        analyze_btn.click(lambda selected, *args: _run_from_ui("analyze", *args, preset_value=selected), inputs=[preset, *config_inputs], outputs=[analyze_out])
+        recommend_btn.click(
+            lambda selected, *args: _run_from_ui("recommend", *args, preset_value=selected),
+            inputs=[preset, *config_inputs],
+            outputs=[recommend_out],
+        )
+        compress_btn.click(
+            lambda stage_value, selected, *args: _run_from_ui("compress", *args, preset_value=selected, stage_value=stage_value),
+            inputs=[stage, preset, *config_inputs],
+            outputs=[compress_out],
+        )
+        distill_btn.click(
+            lambda stage_value, selected, *args: _run_from_ui("distill", *args, preset_value=selected, stage_value=stage_value),
+            inputs=[stage, preset, *config_inputs],
+            outputs=[distill_out],
+        )
+        eval_btn.click(
+            lambda checkpoint_value, selected, *args: _run_from_ui("eval", *args, preset_value=selected, checkpoint_value=checkpoint_value),
+            inputs=[eval_checkpoint, preset, *config_inputs],
+            outputs=[eval_out],
+        )
+        launch_btn.click(
+            lambda backend_value, selected, *args: _run_from_ui("launch", *args, preset_value=selected, backend_value=backend_value),
+            inputs=[launch_backend, preset, *config_inputs],
+            outputs=[launch_out],
+        )
+        run_btn.click(lambda selected, *args: _run_from_ui("run", *args, preset_value=selected), inputs=[preset, *config_inputs], outputs=[run_out])
+        logs_btn.click(log_tail, inputs=[output_dir], outputs=[logs_out])
+        artifacts_btn.click(artifact_index, inputs=[output_dir], outputs=[artifacts_out])
     return demo
