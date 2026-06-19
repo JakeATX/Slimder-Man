@@ -15,6 +15,63 @@ from slimder_man.distill.schedules import cosine_schedule, global_cosine_lr, lin
 from slimder_man.utils.determinism import set_seed
 
 
+def _concrete_int(value: int | str, fallback: int) -> int:
+    return value if isinstance(value, int) else fallback
+
+
+def _optimizer_steps(cfg: SlimderConfig) -> int:
+    if cfg.training.train_steps > 0:
+        return cfg.training.train_steps
+    global_batch = _concrete_int(cfg.training.global_batch_size, _concrete_int(cfg.training.micro_batch_size, 1))
+    tokens_per_step = max(1, global_batch * cfg.training.sequence_length)
+    return max(1, int(np.ceil(cfg.training.token_budget / tokens_per_step)))
+
+
+def _gradient_accumulation_steps(cfg: SlimderConfig, world_size: int = 1) -> int:
+    micro = _concrete_int(cfg.training.micro_batch_size, 1)
+    global_batch = _concrete_int(cfg.training.global_batch_size, micro * world_size)
+    denom = micro * max(1, world_size)
+    if global_batch < denom:
+        raise ValueError("training.global_batch_size must be >= micro_batch_size * world_size")
+    if global_batch % denom != 0:
+        raise ValueError("training.global_batch_size must be divisible by micro_batch_size * world_size")
+    return max(1, global_batch // denom)
+
+
+def _microbatch_size(cfg: SlimderConfig) -> int:
+    return _concrete_int(cfg.training.micro_batch_size, 1)
+
+
+def _microbatch_from_samples(batches: list[torch.Tensor], start: int, micro_batch_size: int) -> torch.Tensor:
+    if not batches:
+        raise ValueError("training requires at least one batch")
+    rows = []
+    collected = 0
+    cursor = start
+    while collected < micro_batch_size:
+        item = batches[cursor % len(batches)]
+        rows.append(item)
+        collected += int(item.shape[0])
+        cursor += 1
+    batch = torch.cat(rows, dim=0)
+    return batch[:micro_batch_size]
+
+
+def _validate_teacher_mode(cfg: SlimderConfig) -> None:
+    if cfg.kd.teacher_mode != "online_full_logits":
+        raise ValueError(
+            f"Local trainer currently supports kd.teacher_mode=online_full_logits only; got {cfg.kd.teacher_mode}. "
+            "Use a remote worker or cache-generation path once that backend is configured."
+        )
+
+
+def _mean_parts(rows: list[dict[str, float]]) -> dict[str, float]:
+    if not rows:
+        return {}
+    keys = rows[0].keys()
+    return {key: float(sum(row[key] for row in rows) / len(rows)) for key in keys}
+
+
 def train_tiny_distill(
     teacher: TinyMoEForCausalLM,
     student: TinyMoEForCausalLM,
@@ -24,6 +81,7 @@ def train_tiny_distill(
     global_step_offset: int = 0,
     global_total_steps: int | None = None,
 ) -> dict:
+    _validate_teacher_mode(cfg)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "trainer_state.json"
@@ -49,12 +107,13 @@ def train_tiny_distill(
     opt_path = out_dir / "optimizer.pt"
     if resume and opt_path.exists():
         opt.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
-    total_steps = cfg.training.train_steps
+    total_steps = _optimizer_steps(cfg)
+    accum_steps = _gradient_accumulation_steps(cfg)
+    micro_batch_size = _microbatch_size(cfg)
     schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
     for step in range(start_step, total_steps):
-        batch = batches[step % len(batches)]
         schedule_step = global_step_offset + step
         lr = global_cosine_lr(
             cfg.training.learning_rate,
@@ -65,34 +124,47 @@ def train_tiny_distill(
         )
         for group in opt.param_groups:
             group["lr"] = lr
-        with torch.no_grad():
-            teacher_out = teacher(batch)
-        student_out = student(batch)
         lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, schedule_step, schedule_total_steps)
         beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, schedule_step, schedule_total_steps)
-        loss, parts = total_distill_loss(
-            student_out,
-            teacher_out,
-            batch,
-            lambda_t,
-            beta_t,
-            cfg.kd.temperature,
-            kd_enabled=cfg.kd.enabled,
-            mtp_enabled=cfg.kd.mtp.enabled,
-        )
-        if not torch.isfinite(loss):
-            raise ValueError("NaN or Inf distillation loss")
-        loss.backward()
+        opt.zero_grad(set_to_none=True)
+        loss_total = 0.0
+        part_rows: list[dict[str, float]] = []
+        for micro_step in range(accum_steps):
+            micro_batch = _microbatch_from_samples(
+                batches,
+                step * accum_steps * micro_batch_size + micro_step * micro_batch_size,
+                micro_batch_size,
+            )
+            with torch.no_grad():
+                teacher_out = teacher(micro_batch)
+            student_out = student(micro_batch)
+            loss, parts = total_distill_loss(
+                student_out,
+                teacher_out,
+                micro_batch,
+                lambda_t,
+                beta_t,
+                cfg.kd.temperature,
+                kd_enabled=cfg.kd.enabled,
+                mtp_enabled=cfg.kd.mtp.enabled,
+            )
+            if not torch.isfinite(loss):
+                raise ValueError("NaN or Inf distillation loss")
+            (loss / accum_steps).backward()
+            loss_total += float(loss.detach())
+            part_rows.append(parts)
         torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.training.max_grad_norm)
         opt.step()
-        opt.zero_grad(set_to_none=True)
+        parts = _mean_parts(part_rows)
         row = {
             "step": schedule_step + 1,
             "stage_step": step + 1,
-            "loss": float(loss.detach()),
+            "loss": loss_total / accum_steps,
             "lambda": lambda_t,
             "beta": beta_t,
             "lr": lr,
+            "gradient_accumulation_steps": accum_steps,
+            "micro_batch_size": micro_batch_size,
             **parts,
         }
         logs.append(row)
@@ -113,11 +185,13 @@ def train_tiny_distill(
                     "stage_step": step + 1,
                     "global_step_offset": global_step_offset,
                     "global_total_steps": schedule_total_steps,
+                    "gradient_accumulation_steps": accum_steps,
+                    "micro_batch_size": micro_batch_size,
                     "logs": logs,
                     "config": cfg.model_dump(mode="json"),
                     "optimizer_state": str(opt_path),
                     "rng_state": str(out_dir / "rng_state.pt"),
-                    "dataloader_position": (step + 1) % len(batches),
+                    "dataloader_position": ((step + 1) * accum_steps * micro_batch_size) % len(batches),
                 },
                 indent=2,
             ),
@@ -132,6 +206,8 @@ def train_tiny_distill(
         "global_step": global_step_offset + total_steps,
         "stage_steps": total_steps,
         "global_total_steps": schedule_total_steps,
+        "gradient_accumulation_steps": accum_steps,
+        "micro_batch_size": micro_batch_size,
         "logs": logs,
         "checkpoint": str(out_dir / "final"),
     }
@@ -148,6 +224,7 @@ def train_causal_lm_distill(
     global_total_steps: int | None = None,
 ) -> dict:
     """Small generic HF-style distillation loop used by non-tiny smoke fixtures."""
+    _validate_teacher_mode(cfg)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "trainer_state.json"
@@ -173,12 +250,13 @@ def train_causal_lm_distill(
     if resume and opt_path.exists():
         opt.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
 
-    total_steps = cfg.training.train_steps
+    total_steps = _optimizer_steps(cfg)
+    accum_steps = _gradient_accumulation_steps(cfg)
+    micro_batch_size = _microbatch_size(cfg)
     schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
     for step in range(start_step, total_steps):
-        batch = batches[step % len(batches)]
         schedule_step = global_step_offset + step
         lr = global_cosine_lr(
             cfg.training.learning_rate,
@@ -189,34 +267,47 @@ def train_causal_lm_distill(
         )
         for group in opt.param_groups:
             group["lr"] = lr
-        with torch.no_grad():
-            teacher_out = teacher(input_ids=batch)
-        student_out = student(input_ids=batch)
         lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, schedule_step, schedule_total_steps)
         beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, schedule_step, schedule_total_steps)
-        loss, parts = total_distill_loss(
-            student_out,
-            teacher_out,
-            batch,
-            lambda_t,
-            beta_t,
-            cfg.kd.temperature,
-            kd_enabled=cfg.kd.enabled,
-            mtp_enabled=cfg.kd.mtp.enabled and bool(getattr(student_out, "mtp_logits", [])),
-        )
-        if not torch.isfinite(loss):
-            raise ValueError("NaN or Inf distillation loss")
-        loss.backward()
+        opt.zero_grad(set_to_none=True)
+        loss_total = 0.0
+        part_rows: list[dict[str, float]] = []
+        for micro_step in range(accum_steps):
+            micro_batch = _microbatch_from_samples(
+                batches,
+                step * accum_steps * micro_batch_size + micro_step * micro_batch_size,
+                micro_batch_size,
+            )
+            with torch.no_grad():
+                teacher_out = teacher(input_ids=micro_batch)
+            student_out = student(input_ids=micro_batch)
+            loss, parts = total_distill_loss(
+                student_out,
+                teacher_out,
+                micro_batch,
+                lambda_t,
+                beta_t,
+                cfg.kd.temperature,
+                kd_enabled=cfg.kd.enabled,
+                mtp_enabled=cfg.kd.mtp.enabled and bool(getattr(student_out, "mtp_logits", [])),
+            )
+            if not torch.isfinite(loss):
+                raise ValueError("NaN or Inf distillation loss")
+            (loss / accum_steps).backward()
+            loss_total += float(loss.detach())
+            part_rows.append(parts)
         torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.training.max_grad_norm)
         opt.step()
-        opt.zero_grad(set_to_none=True)
+        parts = _mean_parts(part_rows)
         row = {
             "step": schedule_step + 1,
             "stage_step": step + 1,
-            "loss": float(loss.detach()),
+            "loss": loss_total / accum_steps,
             "lambda": lambda_t,
             "beta": beta_t,
             "lr": lr,
+            "gradient_accumulation_steps": accum_steps,
+            "micro_batch_size": micro_batch_size,
             **parts,
         }
         logs.append(row)
@@ -238,11 +329,13 @@ def train_causal_lm_distill(
                     "stage_step": step + 1,
                     "global_step_offset": global_step_offset,
                     "global_total_steps": schedule_total_steps,
+                    "gradient_accumulation_steps": accum_steps,
+                    "micro_batch_size": micro_batch_size,
                     "logs": logs,
                     "config": cfg.model_dump(mode="json"),
                     "optimizer_state": str(opt_path),
                     "rng_state": str(out_dir / "rng_state.pt"),
-                    "dataloader_position": (step + 1) % len(batches),
+                    "dataloader_position": ((step + 1) * accum_steps * micro_batch_size) % len(batches),
                 },
                 indent=2,
             ),
@@ -259,6 +352,8 @@ def train_causal_lm_distill(
         "global_step": global_step_offset + total_steps,
         "stage_steps": total_steps,
         "global_total_steps": schedule_total_steps,
+        "gradient_accumulation_steps": accum_steps,
+        "micro_batch_size": micro_batch_size,
         "logs": logs,
         "checkpoint": str(out_dir / "final"),
     }

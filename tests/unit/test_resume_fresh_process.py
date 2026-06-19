@@ -2,12 +2,24 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig
 from slimder_man.distill.train_loop import train_causal_lm_distill
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from fixtures.hf_dummy_moe import DummyHfMoeForCausalLM
+
+
+class RecordingDummyHfMoeForCausalLM(DummyHfMoeForCausalLM):
+    def __init__(self):
+        super().__init__()
+        self.forward_batch_sizes: list[int] = []
+
+    def forward(self, input_ids, labels=None):
+        self.forward_batch_sizes.append(int(input_ids.shape[0]))
+        return super().forward(input_ids, labels=labels)
 
 
 def test_generic_distill_resume_restores_state_with_fresh_model_instance(tmp_path: Path):
@@ -24,9 +36,11 @@ def test_generic_distill_resume_restores_state_with_fresh_model_instance(tmp_pat
 
     first = train_causal_lm_distill(teacher, student, cfg_first, out_dir, batches)
     assert first["global_step"] == 2
+    assert first["gradient_accumulation_steps"] == 2
     state_after_first = json.loads((out_dir / "trainer_state.json").read_text(encoding="utf-8"))
     assert state_after_first["global_step"] == 2
-    assert state_after_first["dataloader_position"] == 2
+    assert state_after_first["dataloader_position"] == 0
+    assert state_after_first["gradient_accumulation_steps"] == 2
     assert (out_dir / "optimizer.pt").exists()
     assert (out_dir / "rng_state.pt").exists()
 
@@ -88,3 +102,72 @@ def test_generic_distill_resume_uses_stage_step_when_global_offset_is_nonzero(tm
     state_after_resume = json.loads((out_dir / "trainer_state.json").read_text(encoding="utf-8"))
     assert state_after_resume["global_step"] == 9
     assert state_after_resume["stage_step"] == 4
+
+
+def test_generic_distill_derives_steps_from_token_budget_and_accumulates_microbatches(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = DummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        calibration={"sample_count": 4, "sequence_length": 8},
+        training={
+            "train_steps": 0,
+            "token_budget": 32,
+            "global_batch_size": 2,
+            "micro_batch_size": 1,
+            "sequence_length": 8,
+            "warmup_steps": 0,
+        },
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    result = train_causal_lm_distill(teacher, student, cfg, tmp_path / "budget_training", batches)
+    state = json.loads((tmp_path / "budget_training" / "trainer_state.json").read_text(encoding="utf-8"))
+
+    assert result["global_step"] == 2
+    assert result["stage_steps"] == 2
+    assert result["gradient_accumulation_steps"] == 2
+    assert [row["gradient_accumulation_steps"] for row in result["logs"]] == [2, 2]
+    assert state["dataloader_position"] == 0
+
+
+def test_generic_distill_micro_batch_size_controls_forward_batch_shape(tmp_path: Path):
+    teacher = RecordingDummyHfMoeForCausalLM()
+    student = RecordingDummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        calibration={"sample_count": 4, "sequence_length": 8},
+        training={
+            "train_steps": 1,
+            "global_batch_size": 4,
+            "micro_batch_size": 2,
+            "sequence_length": 8,
+            "warmup_steps": 0,
+        },
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    result = train_causal_lm_distill(teacher, student, cfg, tmp_path / "microbatch_training", batches)
+    state = json.loads((tmp_path / "microbatch_training" / "trainer_state.json").read_text(encoding="utf-8"))
+
+    assert result["gradient_accumulation_steps"] == 2
+    assert result["micro_batch_size"] == 2
+    assert teacher.forward_batch_sizes == [2, 2]
+    assert student.forward_batch_sizes == [2, 2]
+    assert state["dataloader_position"] == 0
+
+
+def test_generic_distill_rejects_unsupported_teacher_modes(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = DummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        kd={"teacher_mode": "offline_full_logits_cache"},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    with pytest.raises(ValueError, match="online_full_logits only"):
+        train_causal_lm_distill(teacher, student, cfg, tmp_path / "unsupported", batches)

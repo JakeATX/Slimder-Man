@@ -55,7 +55,7 @@ def _concrete_int(value: int | str, fallback: int) -> int:
 
 
 def _stage_train_steps(base_cfg: SlimderConfig, plan: StagePlan) -> int:
-    if base_cfg.training.train_steps <= 0 or plan.tokens <= 0:
+    if plan.tokens <= 0:
         return 0
     batch = _concrete_int(base_cfg.training.global_batch_size, _concrete_int(base_cfg.training.micro_batch_size, 1))
     seq = max(1, base_cfg.training.sequence_length)

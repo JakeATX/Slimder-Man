@@ -25,7 +25,7 @@ def test_progressive_stage_runner_wires_stage_specific_configs(tmp_path):
     cfg = SlimderConfig(
         project={"paper_faithful": False, "output_dir": str(tmp_path)},
         progressive={"schedule": "depth_first", "stages": 2, "token_split": [0.25, 0.75]},
-        training={"token_budget": 100},
+        training={"token_budget": 100, "train_steps": 0, "global_batch_size": 10, "micro_batch_size": 5, "sequence_length": 5},
         compression={"target": {"hidden_size": 12, "remove_last_n_layers": 2, "routed_experts": 4, "routed_top_k": 2}},
     )
     teacher = TinyMoEForCausalLM()
@@ -59,6 +59,7 @@ def test_progressive_stage_runner_wires_stage_specific_configs(tmp_path):
     assert result["global_total_steps"] == 3
     assert ("train", 25, 1, str(tmp_path / "progressive" / "stage_1" / "training")) in seen
     assert ("train", 75, 2, str(tmp_path / "progressive" / "stage_2" / "training")) in seen
+    assert [stage["train_steps"] for stage in result["stages"]] == [1, 2]
 
 
 def test_progressive_stage_runner_executes_real_tiny_stages(tmp_path):
