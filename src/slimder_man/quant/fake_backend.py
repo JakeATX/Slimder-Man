@@ -9,7 +9,9 @@ import torch
 
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.analyze.architecture import describe_model
-from slimder_man.quant.bit_allocator import QuantItem, allocate_bits
+from slimder_man.quant.bit_allocator import allocate_bits
+from slimder_man.quant.export import write_quant_export_manifest
+from slimder_man.quant.sensitivity import quant_items_from_sensitivity, sensitivity_records_for_model
 from slimder_man.utils.hashing import sha256_file
 from slimder_man.utils.json import write_json
 
@@ -23,11 +25,6 @@ def fake_quantize_tensor(tensor: torch.Tensor, bits: int) -> torch.Tensor:
     qmax = (2 ** (bits - 1)) - 1
     scale = max_abs / qmax
     return torch.clamp(torch.round(tensor / scale), min=-qmax, max=qmax) * scale
-
-
-def _protected_bits(name: str) -> int | None:
-    protected_markers = ("router", "gate", "norm", "embed_tokens", "lm_head", "shared")
-    return 16 if any(marker in name for marker in protected_markers) else None
 
 
 def _save_quantized_model(model: torch.nn.Module, output_dir: Path, safe_serialization: bool) -> None:
@@ -55,15 +52,8 @@ def fake_quantize_model(
     safe_serialization: bool = True,
 ) -> dict[str, Any]:
     bits = allowed_bits or [4, 8]
-    items = [
-        QuantItem(
-            name=name,
-            size=param.numel(),
-            saliency=float(param.detach().abs().mean().item()),
-            protected_bits=_protected_bits(name),
-        )
-        for name, param in model.named_parameters()
-    ]
+    sensitivity = sensitivity_records_for_model(model)
+    items = quant_items_from_sensitivity(sensitivity)
     allocation = allocate_bits(items, bits + [16], target_avg_bits)
     quantized = deepcopy(model)
     with torch.no_grad():
@@ -93,6 +83,14 @@ def fake_quantize_model(
         "target_avg_bits": target_avg_bits,
         "allowed_bits": bits,
         "allocation": allocation,
+        "sensitivity": {
+            record.name: {
+                "saliency": record.saliency,
+                "signals": record.signals,
+                "protected_bits": record.protected_bits,
+            }
+            for record in sensitivity
+        },
         "artifact_hashes": artifact_hashes,
         "validation": {
             "finite_loss": True,
@@ -101,7 +99,9 @@ def fake_quantize_model(
         },
         "note": "Fake quantization stores dequantized tensors for runtime smoke tests; it is not a packed production format.",
     }
+    manifest["export_manifest"] = "quant_export_manifest.json"
     write_json(out / "fake_quant_manifest.json", manifest)
+    write_quant_export_manifest(out, "fake_symmetric_uniform", manifest)
     return manifest
 
 

@@ -7,6 +7,9 @@ from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.cli import app
 from slimder_man.config.schema import SlimderConfig, save_config
+from slimder_man.quant.export import collect_export_hashes
+from slimder_man.utils.hashing import sha256_file
+from slimder_man.utils.json import read_json
 
 
 def test_quantize_cli_uses_fake_backend_and_writes_manifests(tmp_path: Path):
@@ -30,10 +33,19 @@ def test_quantize_cli_uses_fake_backend_and_writes_manifests(tmp_path: Path):
     assert "embed_tokens.weight" in manifest["allocation"]
     assert manifest["validation"]["finite_loss"] is True
     assert manifest["artifact_hashes"]["fake_quant_manifest.json"]
+    assert "quantization_manifest.json" not in manifest["artifact_hashes"]
+    assert "export_artifact_hashes" not in manifest
+    for name, digest in manifest["artifact_hashes"].items():
+        assert digest == sha256_file(out_dir / name)
     assert (out_dir / "model.pt").exists()
     assert (out_dir / "config.json").exists()
     assert (out_dir / "fake_quant_manifest.json").exists()
     assert (out_dir / "quantization_manifest.json").exists()
+    export_manifest = read_json(out_dir / "quant_export_manifest.json")
+    assert export_manifest["source_checkpoint"] == str(checkpoint)
+    assert export_manifest["artifact_hashes"] == collect_export_hashes(out_dir)
+    assert "quantization_manifest.json" in export_manifest["artifact_hashes"]
+    assert export_manifest["artifact_hashes"]["quantization_manifest.json"] == sha256_file(out_dir / "quantization_manifest.json")
     reloaded = TinyMoEForCausalLM.from_pretrained(out_dir)
     assert sum(p.numel() for p in reloaded.parameters()) > 0
 
@@ -61,7 +73,12 @@ def test_quantize_cli_supports_hf_dummy_fake_backend(tmp_path: Path):
     assert manifest["validation"]["finite_loss"] is True
     assert "model.layers.0.mlp.gate.weight" in manifest["allocation"]
     assert manifest["allocation"]["model.layers.0.mlp.gate.weight"] == 16
+    for name, digest in manifest["artifact_hashes"].items():
+        assert digest == sha256_file(out_dir / name)
     assert (out_dir / "model.safetensors").exists()
     assert (out_dir / "fake_quant_manifest.json").exists()
+    export_manifest = read_json(out_dir / "quant_export_manifest.json")
+    assert export_manifest["source_checkpoint"] == str(checkpoint)
+    assert "quantization_manifest.json" in export_manifest["artifact_hashes"]
     reloaded = DummyHfMoeForCausalLM.from_pretrained(out_dir)
     assert sum(p.numel() for p in reloaded.parameters()) > 0

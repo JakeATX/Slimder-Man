@@ -29,6 +29,7 @@ from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.local import local_dry_run_commands
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
+from slimder_man.quant.export import write_quant_export_manifest
 from slimder_man.quant.fake_backend import fake_quantize_model
 from slimder_man.ui.app import create_app
 from slimder_man.utils.hashing import sha256_file
@@ -589,10 +590,29 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
         "validation": fake_manifest["validation"],
         "protected_modules": ["router", "gate", "norm", "embed_tokens", "lm_head", "shared"],
         "fake_quant_manifest": "fake_quant_manifest.json",
+        "export_manifest": "quant_export_manifest.json",
         "artifact_hashes": artifact_hashes,
         "note": fake_manifest["note"],
     }
     write_json(out_dir / "quantization_manifest.json", manifest)
+    write_quant_export_manifest(
+        out_dir,
+        manifest["backend"],
+        fake_manifest,
+        source_checkpoint=str(checkpoint),
+    )
+    manifest["artifact_hashes"] = {
+        name: sha256_file(out_dir / name)
+        for name in ("model.pt", "model.safetensors", "pytorch_model.bin", "config.json", "fake_quant_manifest.json")
+        if (out_dir / name).exists()
+    }
+    write_json(out_dir / "quantization_manifest.json", manifest)
+    write_quant_export_manifest(
+        out_dir,
+        manifest["backend"],
+        fake_manifest,
+        source_checkpoint=str(checkpoint),
+    )
     _echo({"checkpoint": str(checkpoint), "out": str(out_dir), "manifest": manifest}, json_output)
 
 
