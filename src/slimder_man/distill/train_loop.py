@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import random
 from pathlib import Path
@@ -9,7 +10,7 @@ import torch
 
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.calibration.datasets import sample_calibration_tokens
-from slimder_man.config.schema import SlimderConfig
+from slimder_man.config.schema import SlimderConfig, load_config
 from slimder_man.distill.losses import total_distill_loss
 from slimder_man.distill.schedules import cosine_schedule, global_cosine_lr, linear_schedule
 from slimder_man.utils.determinism import set_seed
@@ -357,3 +358,62 @@ def train_causal_lm_distill(
         "logs": logs,
         "checkpoint": str(out_dir / "final"),
     }
+
+
+def run_train_loop_entrypoint(
+    config_path: str | Path,
+    output_dir: str | Path | None = None,
+    checkpoint: str | Path | None = None,
+    resume: bool = False,
+) -> dict:
+    cfg = load_config(config_path)
+    set_seed(cfg.project.seed)
+    out_dir = Path(output_dir or Path(cfg.project.output_dir) / "training")
+    if cfg.teacher.load_mode == "tiny":
+        teacher = TinyMoEForCausalLM()
+        if checkpoint:
+            student = TinyMoEForCausalLM.from_pretrained(checkpoint)
+        elif resume and (out_dir / "resume_model").exists():
+            student = TinyMoEForCausalLM.from_pretrained(out_dir / "resume_model")
+        else:
+            student = TinyMoEForCausalLM()
+        result = train_tiny_distill(teacher, student, cfg, out_dir, resume=resume)
+        return {"entrypoint": "slimder_man.distill.train_loop", "mode": "tiny", **result}
+
+    if cfg.teacher.model_id_or_path != "dummy-hf-moe":
+        raise ValueError(
+            "train_loop entrypoint currently supports teacher.load_mode=tiny or model_id_or_path=dummy-hf-moe. "
+            "Use `slimder compress` followed by `slimder distill`, remote launch, or a model-specific training config for real checkpoints."
+        )
+
+    from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM, DummyTokenizer
+
+    teacher = DummyHfMoeForCausalLM()
+    if checkpoint:
+        student = DummyHfMoeForCausalLM.from_pretrained(checkpoint)
+    elif resume and (out_dir / "resume_model").exists():
+        student = DummyHfMoeForCausalLM.from_pretrained(out_dir / "resume_model")
+    else:
+        student = DummyHfMoeForCausalLM()
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size, tokenizer=DummyTokenizer())
+    result = train_causal_lm_distill(teacher, student, cfg, out_dir, batches, resume=resume)
+    return {"entrypoint": "slimder_man.distill.train_loop", "mode": "dummy_hf_moe", **result}
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run Slimder Man distillation training.")
+    parser.add_argument("--config", required=True, help="Slimder YAML config.")
+    parser.add_argument("--output-dir", default=None, help="Training output directory. Defaults to project.output_dir/training.")
+    parser.add_argument("--checkpoint", default=None, help="Optional student checkpoint to resume/init from.")
+    parser.add_argument("--resume", action="store_true", help="Resume optimizer/RNG/model state from output-dir.")
+    parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    args = parser.parse_args(argv)
+    result = run_train_loop_entrypoint(args.config, args.output_dir, args.checkpoint, resume=args.resume)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(result)
+
+
+if __name__ == "__main__":
+    main()
