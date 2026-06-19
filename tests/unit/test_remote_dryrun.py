@@ -6,11 +6,29 @@ from typer.testing import CliRunner
 
 from slimder_man.cli import app
 from slimder_man.config.schema import SlimderConfig, save_config
+from slimder_man.orchestration.jobs import CommandResult
 from slimder_man.orchestration.local import local_dry_run_commands, local_preflight
 from slimder_man.orchestration.materialize_config import materialize_remote_config
 from slimder_man.orchestration.skypilot import skypilot_yaml
-from slimder_man.orchestration.ssh import ssh_dry_run_commands
+from slimder_man.orchestration.ssh import SSHRunner, ssh_command_plan, ssh_dry_run_commands
 from slimder_man.utils.hashing import redact_secret
+
+
+class RecordingExecutor:
+    def __init__(self, fail_on: str | None = None):
+        self.fail_on = fail_on
+        self.commands: list[str] = []
+
+    def run(self, command: str) -> CommandResult:
+        self.commands.append(command)
+        if self.fail_on and self.fail_on in command:
+            return CommandResult(command=command, returncode=17, stderr="boom")
+        return CommandResult(command=command, returncode=0, stdout="ok")
+
+    def stream(self, command: str):
+        self.commands.append(command)
+        yield "log-line-1"
+        yield "token=hf_abcdef123"
 
 
 def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
@@ -28,6 +46,10 @@ def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
     joined = "\n".join(cmds)
     assert any("rsync" in c for c in cmds)
     assert any("nvidia-smi" in c for c in cmds)
+    assert "CUDA_NOT_AVAILABLE" not in joined
+    assert any("df -h ." in c for c in cmds)
+    assert any("import torch" in c for c in cmds)
+    assert "TORCH_NOT_INSTALLED_YET" not in joined
     assert any("pip install -e .[dev]" in c for c in cmds)
     assert "custom-launch.yaml" in joined
     assert "configs/launch_config.yaml" in joined
@@ -56,6 +78,79 @@ def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
     assert "HF_TOKEN" in yml
     assert "hf_***REDACTED***" in redact_secret("token=hf_abcdef123")
     assert "hf_dummy.yaml" in redact_secret("src/slimder_man/config/examples/hf_dummy.yaml")
+
+
+def test_ssh_plan_syncs_resolved_repo_root_and_quotes_excludes(tmp_path: Path):
+    cfg = SlimderConfig(project={"paper_faithful": False, "output_dir": str(tmp_path / "run")})
+    repo_root = tmp_path / "repo root"
+    config_path = tmp_path / "launch.yaml"
+    save_config(cfg, config_path)
+
+    first = ssh_command_plan(config_path, cfg, repo_root=repo_root)[0].command
+
+    synced_source = str(repo_root.resolve()).replace("\\", "/").rstrip("/") + "/"
+    assert synced_source in first
+    assert " './'" not in first
+    assert "--exclude '.git'" in first
+    assert "--exclude '.venv'" in first
+
+
+def test_ssh_runner_stops_on_failed_required_preflight(tmp_path: Path):
+    config_path = tmp_path / "launch.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run")},
+        runtime={"ssh": {"host": "host", "user": "user", "dry_run": False}},
+    )
+    save_config(cfg, config_path)
+    executor = RecordingExecutor(fail_on="nvidia-smi")
+
+    result = SSHRunner(config_path, cfg, executor=executor).launch()
+
+    assert result.status == "failed"
+    assert result.failed_command is not None and "nvidia-smi" in result.failed_command
+    assert any("nvidia-smi" in command for command in executor.commands)
+    assert not any("pip install -e" in command for command in executor.commands)
+
+
+def test_ssh_runner_executes_ordered_stages_and_stops_on_failure(tmp_path: Path):
+    config_path = tmp_path / "launch.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run")},
+        runtime={"ssh": {"host": "host", "user": "user", "dry_run": False}},
+    )
+    save_config(cfg, config_path)
+    executor = RecordingExecutor(fail_on="cli compress")
+
+    result = SSHRunner(config_path, cfg, executor=executor).launch()
+
+    assert result.status == "failed"
+    assert result.failed_command is not None and "cli compress" in result.failed_command
+    assert any("materialize_config" in command for command in executor.commands)
+    assert any("cli analyze" in command for command in executor.commands)
+    assert any("cli recommend" in command for command in executor.commands)
+    assert any("cli compress" in command for command in executor.commands)
+    assert not any("cli distill" in command for command in executor.commands)
+    assert not any("tail -n 200 -f" in command for command in executor.commands)
+
+
+def test_ssh_runner_exposes_log_stop_and_sync_operations(tmp_path: Path):
+    config_path = tmp_path / "launch.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run")},
+        runtime={"ssh": {"host": "host", "user": "user", "dry_run": False}},
+    )
+    save_config(cfg, config_path)
+    executor = RecordingExecutor()
+    runner = SSHRunner(config_path, cfg, executor=executor)
+
+    logs = list(runner.stream_logs())
+    stop = runner.stop()
+    sync = runner.sync_outputs()
+
+    assert logs == ["log-line-1", "token=hf_***REDACTED***"]
+    assert "tail -n 200 -f" in executor.commands[0]
+    assert stop.ok and "pkill -f slimder_man.cli" in executor.commands[1]
+    assert sync.ok and executor.commands[2].startswith("rsync -az")
 
 
 def test_local_launch_for_hf_dummy_emits_executable_run_plan(tmp_path: Path):
