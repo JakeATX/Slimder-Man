@@ -189,6 +189,7 @@ class EvaluationConfig(StrictBaseModel):
 
 class RuntimeLocalConfig(StrictBaseModel):
     num_gpus: int | Literal["auto"] = "auto"
+    allow_full_model_run: bool = False
 
 
 class RuntimeSSHConfig(StrictBaseModel):

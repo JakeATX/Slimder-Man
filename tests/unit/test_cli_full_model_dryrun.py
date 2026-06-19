@@ -184,7 +184,7 @@ def test_validate_checkpoint_fails_on_tampered_calibration_artifact(tmp_path: Pa
         assert any("calibration artifact hash mismatch" in error for error in payload["errors"])
 
 
-def test_run_rejects_non_dummy_transformers_without_local_preflight(monkeypatch, tmp_path: Path):
+def test_run_rejects_non_dummy_transformers_without_explicit_local_opt_in(monkeypatch, tmp_path: Path):
     from slimder_man import cli
 
     loaded = False
@@ -192,11 +192,11 @@ def test_run_rejects_non_dummy_transformers_without_local_preflight(monkeypatch,
     def fail_if_loaded(_cfg):
         nonlocal loaded
         loaded = True
-        raise AssertionError("non-dummy full run should reject before model loading")
+        raise AssertionError("non-opted-in full run should reject before model loading")
 
     monkeypatch.setattr(cli, "_load_model", fail_if_loaded)
     cfg = SlimderConfig(
-        project={"output_dir": str(tmp_path / "out")},
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
         teacher={"load_mode": "transformers", "model_id_or_path": "Qwen/Qwen3-Next-80B-A3B-Instruct"},
     )
     config_path = tmp_path / "qwen.yaml"
@@ -205,7 +205,35 @@ def test_run_rejects_non_dummy_transformers_without_local_preflight(monkeypatch,
     result = CliRunner().invoke(app, ["run", str(config_path), "--json"])
 
     assert result.exit_code != 0
+    assert "allow_full_model_run=true" in result.output
     assert loaded is False
+
+
+def test_run_accepts_opted_in_non_dummy_transformers_through_generic_hf_pipeline(monkeypatch, tmp_path: Path):
+    from slimder_man import cli
+
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/non-dummy-moe"},
+        student={"output_format": "hf_safetensors"},
+        runtime={"local": {"allow_full_model_run": True}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+        training={"train_steps": 1, "micro_batch_size": 1, "global_batch_size": 1},
+        compression={"target": {"hidden_size": 12, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
+    )
+    config_path = tmp_path / "full.yaml"
+    config_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setattr(cli, "_load_model", lambda _cfg: DummyHfMoeForCausalLM())
+    monkeypatch.setattr(cli, "_load_tokenizer", lambda _cfg: DummyTokenizer())
+
+    result = CliRunner().invoke(app, ["run", str(config_path), "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["manifest"]["teacher_model"] == "org/non-dummy-moe"
+    assert Path(payload["checkpoint"], "model.safetensors").exists()
+    assert payload["training"]["global_step"] == 1
 
 
 def test_causal_lm_perplexity_rejects_missing_losses():

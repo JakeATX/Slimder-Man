@@ -461,10 +461,10 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
         _echo(_dry_run_plan(cfg, config), json_output)
         return
     if cfg.teacher.load_mode != "tiny":
-        if cfg.teacher.model_id_or_path != "dummy-hf-moe":
+        if cfg.teacher.model_id_or_path != "dummy-hf-moe" and not cfg.runtime.local.allow_full_model_run:
             raise typer.BadParameter(
-                "Full local run is currently enabled only for the bundled dummy-hf-moe smoke fixture; "
-                "use --dry-run plus explicit analyze/compress/distill or launch remote orchestration for real checkpoints."
+                "Full local run for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true. "
+                "Use --dry-run, explicit staged analyze/compress/distill commands, or remote launch for large checkpoints."
             )
         teacher = _load_model(cfg)
         arch = describe_model(teacher)
