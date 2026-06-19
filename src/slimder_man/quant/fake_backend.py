@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
+from slimder_man.analyze.architecture import describe_model
 from slimder_man.quant.bit_allocator import QuantItem, allocate_bits
 from slimder_man.utils.hashing import sha256_file
 from slimder_man.utils.json import write_json
@@ -24,15 +26,33 @@ def fake_quantize_tensor(tensor: torch.Tensor, bits: int) -> torch.Tensor:
 
 
 def _protected_bits(name: str) -> int | None:
-    protected_markers = ("router", "norm", "embed_tokens", "lm_head", "shared")
+    protected_markers = ("router", "gate", "norm", "embed_tokens", "lm_head", "shared")
     return 16 if any(marker in name for marker in protected_markers) else None
 
 
-def fake_quantize_tiny_model(
-    model: TinyMoEForCausalLM,
+def _save_quantized_model(model: torch.nn.Module, output_dir: Path, safe_serialization: bool) -> None:
+    if isinstance(model, TinyMoEForCausalLM):
+        model.save_pretrained(output_dir)
+        return
+    if not hasattr(model, "save_pretrained"):
+        raise ValueError("Fake quantized model does not expose save_pretrained")
+    save_pretrained = model.save_pretrained
+    signature = inspect.signature(save_pretrained)
+    accepts_safe_serialization = "safe_serialization" in signature.parameters or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
+    )
+    if accepts_safe_serialization:
+        model.save_pretrained(output_dir, safe_serialization=safe_serialization)
+    else:
+        model.save_pretrained(output_dir)
+
+
+def fake_quantize_model(
+    model: torch.nn.Module,
     output_dir: str | Path,
     target_avg_bits: float = 8.0,
     allowed_bits: list[int] | None = None,
+    safe_serialization: bool = True,
 ) -> dict[str, Any]:
     bits = allowed_bits or [4, 8]
     items = [
@@ -49,20 +69,27 @@ def fake_quantize_tiny_model(
     with torch.no_grad():
         for name, param in quantized.named_parameters():
             param.copy_(fake_quantize_tensor(param, allocation[name]))
-    validation_input = torch.arange(0, min(8, model.config.vocab_size), dtype=torch.long).unsqueeze(0) % model.config.vocab_size
+    arch = describe_model(model)
+    vocab_size = int(arch["vocab_size"])
+    validation_input = torch.arange(0, min(8, vocab_size), dtype=torch.long).unsqueeze(0) % vocab_size
     with torch.no_grad():
-        validation_out = quantized(validation_input, labels=validation_input)
+        validation_out = (
+            quantized(validation_input, labels=validation_input)
+            if isinstance(quantized, TinyMoEForCausalLM)
+            else quantized(input_ids=validation_input, labels=validation_input)
+        )
     if validation_out.loss is None or not torch.isfinite(validation_out.loss):
         raise ValueError("Fake quantized model failed finite-loss validation")
     out = Path(output_dir)
-    quantized.save_pretrained(out)
+    _save_quantized_model(quantized, out, safe_serialization=safe_serialization)
     artifact_hashes = {
         name: sha256_file(out / name)
-        for name in ("model.pt", "config.json")
+        for name in ("model.pt", "model.safetensors", "pytorch_model.bin", "config.json")
         if (out / name).exists()
     }
     manifest = {
         "backend": "fake_symmetric_uniform",
+        "model_type": arch["model_type"],
         "target_avg_bits": target_avg_bits,
         "allowed_bits": bits,
         "allocation": allocation,
@@ -76,3 +103,12 @@ def fake_quantize_tiny_model(
     }
     write_json(out / "fake_quant_manifest.json", manifest)
     return manifest
+
+
+def fake_quantize_tiny_model(
+    model: TinyMoEForCausalLM,
+    output_dir: str | Path,
+    target_avg_bits: float = 8.0,
+    allowed_bits: list[int] | None = None,
+) -> dict[str, Any]:
+    return fake_quantize_model(model, output_dir, target_avg_bits=target_avg_bits, allowed_bits=allowed_bits)

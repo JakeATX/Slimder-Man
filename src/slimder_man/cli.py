@@ -29,7 +29,7 @@ from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.local import local_dry_run_commands
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
-from slimder_man.quant.fake_backend import fake_quantize_tiny_model
+from slimder_man.quant.fake_backend import fake_quantize_model
 from slimder_man.ui.app import create_app
 from slimder_man.utils.hashing import sha256_file
 from slimder_man.utils.json import read_json, write_json
@@ -569,26 +569,25 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
     set_seed(cfg.project.seed)
     if cfg.project.paper_faithful:
         raise typer.BadParameter("paper_faithful mode rejects quantization")
-    if cfg.teacher.load_mode != "tiny":
-        raise typer.BadParameter("Only the fake tiny quantization backend is implemented; HF AWQ/GPTQ/SmoothQuant/bnb adapters remain explicit future backends.")
     out_dir = Path(cfg.project.output_dir) / "quantized"
     out_dir.mkdir(parents=True, exist_ok=True)
-    model = TinyMoEForCausalLM.from_pretrained(checkpoint)
+    model, kind = _load_checkpoint_auto(checkpoint)
     target_bits = cfg.quantization.target_avg_bits or 8.0
-    fake_manifest = fake_quantize_tiny_model(model, out_dir, target_avg_bits=target_bits)
+    fake_manifest = fake_quantize_model(model, out_dir, target_avg_bits=target_bits, safe_serialization=cfg.student.output_format == "hf_safetensors")
     artifact_hashes = {
         name: sha256_file(out_dir / name)
-        for name in ("model.pt", "config.json", "fake_quant_manifest.json")
+        for name in ("model.pt", "model.safetensors", "pytorch_model.bin", "config.json", "fake_quant_manifest.json")
         if (out_dir / name).exists()
     }
     manifest = {
         "mode": cfg.quantization.mode,
         "backend": fake_manifest["backend"],
+        "checkpoint_kind": kind,
         "source_checkpoint": str(checkpoint),
         "target_avg_bits": target_bits,
         "allocation": fake_manifest["allocation"],
         "validation": fake_manifest["validation"],
-        "protected_modules": ["router", "norm", "embed_tokens", "lm_head", "shared"],
+        "protected_modules": ["router", "gate", "norm", "embed_tokens", "lm_head", "shared"],
         "fake_quant_manifest": "fake_quant_manifest.json",
         "artifact_hashes": artifact_hashes,
         "note": fake_manifest["note"],
