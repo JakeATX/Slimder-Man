@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from slimder_man.calibration.collectors import collect_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
@@ -11,6 +12,16 @@ from slimder_man.adapters.qwen3_next import Qwen3NextAdapter
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from fixtures.hf_dummy_moe import DummyHfMoeConfig, DummyHfMoeForCausalLM
+
+
+class DenseMlp(nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int):
+        super().__init__()
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(torch.relu(self.up_proj(x)))
 
 
 def test_qwen3_next_adapter_uses_structural_moe_detection():
@@ -30,6 +41,20 @@ def test_qwen3_next_adapter_uses_structural_moe_detection():
     assert info.moe_layers[0].num_routed_experts == config.num_experts
     assert info.moe_layers[0].num_shared_experts == config.num_shared_experts
     assert info.moe_layers[0].top_k == config.num_experts_per_tok
+
+
+def test_qwen3_next_adapter_reports_actual_sparse_moe_block_indices():
+    config = DummyHfMoeConfig(model_type="qwen3_next", num_hidden_layers=3)
+    model = DummyHfMoeForCausalLM(config)
+    model.model.layers[1].mlp = DenseMlp(config.hidden_size, config.intermediate_size)
+    adapter = Qwen3NextAdapter()
+
+    layers = adapter.iter_moe_layers(model)
+    info = adapter.describe_architecture(model)
+
+    assert len(layers) == 2
+    assert [layer.layer_idx for layer in info.moe_layers] == [0, 2]
+    assert info.num_layers == 3
 
 
 def test_qwen3_next_fixture_compresses_width_depth_and_experts(tmp_path: Path):

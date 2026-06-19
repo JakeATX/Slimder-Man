@@ -45,7 +45,7 @@ class Qwen3NextAdapter:
             num_linear_attention_layers=sum(1 for k in block_kinds if k == "linear_attention"),
             moe_layers=[
                 MoELayerInfo(
-                    i,
+                    self._layer_idx_for_moe(moe, layers, fallback=i),
                     n_experts or len(self.get_routed_experts(moe)),
                     shared or len(self.get_shared_experts(moe)),
                     top_k or int(getattr(moe, "top_k", getattr(moe, "num_experts_per_tok", getattr(moe, "moe_top_k", 0))) or 0),
@@ -148,3 +148,9 @@ class Qwen3NextAdapter:
 
     def save_pretrained(self, model: nn.Module, output_dir: str, manifest: dict | None = None) -> None:
         model.save_pretrained(output_dir, safe_serialization=True)
+
+    def _layer_idx_for_moe(self, moe: nn.Module, layers: list[nn.Module], fallback: int) -> int:
+        for idx, layer in enumerate(layers):
+            if any(child is moe for child in layer.modules()):
+                return idx
+        return fallback
