@@ -73,6 +73,13 @@ def _mean_parts(rows: list[dict[str, float]]) -> dict[str, float]:
     return {key: float(sum(row[key] for row in rows) / len(rows)) for key in keys}
 
 
+def _moe_aux_weight(cfg: SlimderConfig) -> float:
+    value = cfg.training.moe_aux_loss.weight
+    if value == "adapter_default":
+        return 0.0
+    return float(value)
+
+
 def train_tiny_distill(
     teacher: TinyMoEForCausalLM,
     student: TinyMoEForCausalLM,
@@ -111,6 +118,7 @@ def train_tiny_distill(
     total_steps = _optimizer_steps(cfg)
     accum_steps = _gradient_accumulation_steps(cfg)
     micro_batch_size = _microbatch_size(cfg)
+    moe_aux_weight = _moe_aux_weight(cfg)
     schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
@@ -148,6 +156,7 @@ def train_tiny_distill(
                 cfg.kd.temperature,
                 kd_enabled=cfg.kd.enabled,
                 mtp_enabled=cfg.kd.mtp.enabled,
+                moe_aux_weight=moe_aux_weight,
             )
             if not torch.isfinite(loss):
                 raise ValueError("NaN or Inf distillation loss")
@@ -254,6 +263,7 @@ def train_causal_lm_distill(
     total_steps = _optimizer_steps(cfg)
     accum_steps = _gradient_accumulation_steps(cfg)
     micro_batch_size = _microbatch_size(cfg)
+    moe_aux_weight = _moe_aux_weight(cfg)
     schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
@@ -291,6 +301,7 @@ def train_causal_lm_distill(
                 cfg.kd.temperature,
                 kd_enabled=cfg.kd.enabled,
                 mtp_enabled=cfg.kd.mtp.enabled and bool(getattr(student_out, "mtp_logits", [])),
+                moe_aux_weight=moe_aux_weight,
             )
             if not torch.isfinite(loss):
                 raise ValueError("NaN or Inf distillation loss")

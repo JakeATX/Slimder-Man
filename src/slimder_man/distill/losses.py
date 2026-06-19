@@ -48,12 +48,38 @@ def total_distill_loss(
     temperature: float = 1.0,
     kd_enabled: bool = True,
     mtp_enabled: bool = True,
+    moe_aux_weight: float = 0.0,
 ):
     l_lm = lm_loss(student_out.logits, input_ids)
     zero = l_lm * 0
     l_kd = kd_loss(student_out.logits, teacher_out.logits, temperature) if kd_enabled else zero
     l_mtp_lm, l_mtp_kd = mtp_losses(student_out.mtp_logits, teacher_out.logits, input_ids, temperature) if mtp_enabled else (zero, zero)
+    l_moe_aux = _moe_aux_loss(student_out, zero) if moe_aux_weight != 0.0 else zero
     effective_lambda = lambda_t if kd_enabled else 0.0
     effective_beta = beta_t if mtp_enabled else 0.0
-    total = (1 - effective_lambda) * l_lm + effective_lambda * l_kd + effective_beta * ((1 - effective_lambda) * l_mtp_lm + effective_lambda * l_mtp_kd)
-    return total, {"loss_lm": float(l_lm.detach()), "loss_kd": float(l_kd.detach()), "loss_mtp_lm": float(l_mtp_lm.detach()), "loss_mtp_kd": float(l_mtp_kd.detach())}
+    total = (
+        (1 - effective_lambda) * l_lm
+        + effective_lambda * l_kd
+        + effective_beta * ((1 - effective_lambda) * l_mtp_lm + effective_lambda * l_mtp_kd)
+        + moe_aux_weight * l_moe_aux
+    )
+    return total, {
+        "loss_lm": float(l_lm.detach()),
+        "loss_kd": float(l_kd.detach()),
+        "loss_mtp_lm": float(l_mtp_lm.detach()),
+        "loss_mtp_kd": float(l_mtp_kd.detach()),
+        "loss_moe_aux": float(l_moe_aux.detach()),
+        "moe_aux_weight": float(moe_aux_weight),
+    }
+
+
+def _moe_aux_loss(student_out, zero: torch.Tensor) -> torch.Tensor:
+    for name in ("aux_loss", "router_aux_loss", "moe_aux_loss"):
+        value = getattr(student_out, name, None)
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            value = value.to(device=zero.device, dtype=zero.dtype)
+            return value.mean() if value.ndim > 0 else value
+        return zero + float(value)
+    return zero

@@ -22,6 +22,21 @@ class RecordingDummyHfMoeForCausalLM(DummyHfMoeForCausalLM):
         return super().forward(input_ids, labels=labels)
 
 
+class AuxLossDummyHfMoeForCausalLM(DummyHfMoeForCausalLM):
+    def forward(self, input_ids, labels=None):
+        out = super().forward(input_ids, labels=labels)
+        return type(
+            "AuxDummyCausalLMOutput",
+            (),
+            {
+                "logits": out.logits,
+                "loss": out.loss,
+                "mtp_logits": out.mtp_logits,
+                "aux_loss": out.logits.sum() * 0 + 3.0,
+            },
+        )()
+
+
 def test_generic_distill_resume_restores_state_with_fresh_model_instance(tmp_path: Path):
     teacher = DummyHfMoeForCausalLM()
     student = DummyHfMoeForCausalLM()
@@ -171,3 +186,29 @@ def test_generic_distill_rejects_unsupported_teacher_modes(tmp_path: Path):
 
     with pytest.raises(ValueError, match="online_full_logits only"):
         train_causal_lm_distill(teacher, student, cfg, tmp_path / "unsupported", batches)
+
+
+def test_generic_distill_logs_moe_aux_loss_when_model_exposes_it(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = AuxLossDummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        calibration={"sample_count": 2, "sequence_length": 8},
+        training={
+            "train_steps": 1,
+            "global_batch_size": 1,
+            "micro_batch_size": 1,
+            "warmup_steps": 0,
+            "moe_aux_loss": {"weight": 0.5},
+        },
+        kd={"enabled": False, "mtp": {"enabled": False}},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    result = train_causal_lm_distill(teacher, student, cfg, tmp_path / "aux_training", batches)
+
+    row = result["logs"][0]
+    assert row["loss_moe_aux"] == 3.0
+    assert row["moe_aux_weight"] == 0.5
+    assert row["loss"] == pytest.approx(row["loss_lm"] + 1.5, rel=1e-5)

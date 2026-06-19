@@ -6,8 +6,8 @@ import torch
 from slimder_man.distill.losses import kd_loss, lm_loss, mtp_losses, total_distill_loss
 
 
-def _out(logits: torch.Tensor, mtp_logits: list[torch.Tensor] | None = None):
-    return SimpleNamespace(logits=logits, mtp_logits=mtp_logits or [])
+def _out(logits: torch.Tensor, mtp_logits: list[torch.Tensor] | None = None, aux_loss=None):
+    return SimpleNamespace(logits=logits, mtp_logits=mtp_logits or [], aux_loss=aux_loss)
 
 
 def test_kd_disabled_uses_lm_loss_even_when_lambda_is_one():
@@ -80,3 +80,75 @@ def test_kd_temperature_must_be_positive():
         kd_loss(logits, logits, 0.0)
     with pytest.raises(ValueError, match="temperature must be positive"):
         mtp_losses([logits], logits, torch.tensor([[0, 1, 2]]), -1.0)
+
+
+def test_moe_aux_loss_is_weighted_and_logged():
+    input_ids = torch.tensor([[0, 1, 2, 3]])
+    student_logits = torch.zeros(1, 4, 5)
+    teacher_logits = torch.zeros(1, 4, 5)
+
+    base, base_parts = total_distill_loss(
+        _out(student_logits),
+        _out(teacher_logits),
+        input_ids,
+        lambda_t=0.0,
+        beta_t=0.0,
+        kd_enabled=False,
+        mtp_enabled=False,
+    )
+    total, parts = total_distill_loss(
+        _out(student_logits, aux_loss=torch.tensor(2.0)),
+        _out(teacher_logits),
+        input_ids,
+        lambda_t=0.0,
+        beta_t=0.0,
+        kd_enabled=False,
+        mtp_enabled=False,
+        moe_aux_weight=0.25,
+    )
+
+    assert torch.allclose(total, base + 0.5)
+    assert base_parts["loss_moe_aux"] == 0.0
+    assert parts["loss_moe_aux"] == 2.0
+    assert parts["moe_aux_weight"] == 0.25
+
+
+def test_zero_weight_moe_aux_is_inert_even_when_nonfinite_or_vector():
+    input_ids = torch.tensor([[0, 1, 2, 3]])
+    student_logits = torch.zeros(1, 4, 5)
+    teacher_logits = torch.zeros(1, 4, 5)
+
+    total, parts = total_distill_loss(
+        _out(student_logits, aux_loss=torch.tensor([float("nan"), 1.0])),
+        _out(teacher_logits),
+        input_ids,
+        lambda_t=0.0,
+        beta_t=0.0,
+        kd_enabled=False,
+        mtp_enabled=False,
+        moe_aux_weight=0.0,
+    )
+
+    assert torch.isfinite(total)
+    assert parts["loss_moe_aux"] == 0.0
+
+
+def test_vector_moe_aux_loss_is_reduced_when_enabled():
+    input_ids = torch.tensor([[0, 1, 2, 3]])
+    student_logits = torch.zeros(1, 4, 5)
+    teacher_logits = torch.zeros(1, 4, 5)
+
+    total, parts = total_distill_loss(
+        _out(student_logits, aux_loss=torch.tensor([1.0, 3.0])),
+        _out(teacher_logits),
+        input_ids,
+        lambda_t=0.0,
+        beta_t=0.0,
+        kd_enabled=False,
+        mtp_enabled=False,
+        moe_aux_weight=0.5,
+    )
+
+    assert torch.isfinite(total)
+    assert parts["loss_moe_aux"] == 2.0
+    assert parts["moe_aux_weight"] == 0.5
