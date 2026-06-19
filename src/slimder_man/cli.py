@@ -603,9 +603,9 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
         plan = local_dry_run_commands(config, cfg)
         result = {"backend": "local", "commands": plan.commands, "preflight": plan.preflight, "output_dir": plan.output_dir}
     elif backend == "ssh":
-        result = {"backend": "ssh", "commands": ssh_dry_run_commands(cfg).commands}
+        result = {"backend": "ssh", "commands": ssh_dry_run_commands(config, cfg).commands}
     elif backend == "skypilot":
-        result = {"backend": "skypilot", "yaml": skypilot_yaml(cfg)}
+        result = {"backend": "skypilot", "yaml": skypilot_yaml(config, cfg)}
     else:
         result = {"backend": backend, "status": "unsupported"}
     _echo(result, json_output)

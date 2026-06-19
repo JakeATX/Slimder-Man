@@ -5,20 +5,55 @@ import yaml
 from typer.testing import CliRunner
 
 from slimder_man.cli import app
-from slimder_man.config.schema import SlimderConfig
+from slimder_man.config.schema import SlimderConfig, save_config
 from slimder_man.orchestration.local import local_dry_run_commands, local_preflight
+from slimder_man.orchestration.materialize_config import materialize_remote_config
 from slimder_man.orchestration.skypilot import skypilot_yaml
 from slimder_man.orchestration.ssh import ssh_dry_run_commands
 from slimder_man.utils.hashing import redact_secret
 
 
-def test_ssh_and_skypilot_dry_runs_redact():
-    cfg = SlimderConfig(project={"paper_faithful": False}, runtime={"backend": "ssh", "ssh": {"host": "host", "user": "user"}})
-    cmds = ssh_dry_run_commands(cfg).commands
+def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
+    config_path = tmp_path / "custom launch.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run out")},
+        runtime={
+            "backend": "ssh",
+            "ssh": {"host": "host", "user": "user", "port": 2222, "key_path": str(tmp_path / "id key")},
+            "skypilot": {"cloud": "aws", "autostop_minutes": 45},
+        },
+    )
+    save_config(cfg, config_path)
+    cmds = ssh_dry_run_commands(config_path, cfg).commands
+    joined = "\n".join(cmds)
     assert any("rsync" in c for c in cmds)
     assert any("nvidia-smi" in c for c in cmds)
-    yml = skypilot_yaml(cfg)
-    assert "accelerators" in yml and "slimder run" in yml
+    assert any("pip install -e .[dev]" in c for c in cmds)
+    assert "custom-launch.yaml" in joined
+    assert "configs/launch_config.yaml" in joined
+    assert "outputs/run-out" in joined
+    assert "mkdir -p ~/slimder-man/configs ~/slimder-man/outputs ~/slimder-man/logs" in joined
+    assert "-e \"ssh -p 2222 -i '" in joined
+    assert "/id key'\"" in joined
+    assert "run out/training/final" not in joined
+    assert any("cli analyze" in c for c in cmds)
+    assert any("cli compress" in c for c in cmds)
+    assert any("cli distill" in c for c in cmds)
+    assert any("tail -n 200 -f" in c for c in cmds)
+    assert any("pkill -f slimder_man.cli" in c for c in cmds)
+    yml = skypilot_yaml(config_path, cfg)
+    yml_data = yaml.safe_load(yml)
+    assert yml_data["resources"]["infra"] == "aws"
+    assert yml_data["resources"]["autostop"]["idle_minutes"] == 45
+    assert "output_sync" not in yml_data and "workdir_sync" not in yml_data
+    assert "accelerators" in yml and "slimder_man.cli run" in yml
+    assert yml_data["file_mounts"]["configs/source_config.yaml"] == str(config_path)
+    assert "configs/launch_config.yaml" in yml
+    assert "outputs/run-out" in yml
+    assert "slimder_man.cli analyze" in yml
+    assert "slimder_man.cli compress" in yml
+    assert "slimder_man.cli distill" in yml
+    assert "HF_TOKEN" in yml
     assert "hf_***REDACTED***" in redact_secret("token=hf_abcdef123")
     assert "hf_dummy.yaml" in redact_secret("src/slimder_man/config/examples/hf_dummy.yaml")
 
@@ -62,3 +97,16 @@ def test_local_preflight_reports_missing_package_warning(tmp_path: Path):
     checks = local_preflight(cfg, repo_root=tmp_path)
     package = next(check for check in checks if check["name"] == "package")
     assert package["status"] == "warning"
+
+
+def test_materialize_remote_config_rewrites_output_dir(tmp_path: Path):
+    source = tmp_path / "source.yaml"
+    dest = tmp_path / "remote" / "launch_config.yaml"
+    cfg = SlimderConfig(project={"paper_faithful": False, "output_dir": str(tmp_path / "local out")})
+    save_config(cfg, source)
+
+    payload = materialize_remote_config(source, dest, "outputs/remote-out")
+    rewritten = SlimderConfig.model_validate(yaml.safe_load(dest.read_text(encoding="utf-8")))
+
+    assert payload["destination"] == str(dest)
+    assert rewritten.project.output_dir == "outputs/remote-out"
