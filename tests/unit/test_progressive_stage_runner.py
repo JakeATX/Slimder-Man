@@ -48,7 +48,7 @@ def test_progressive_stage_runner_wires_stage_specific_configs(tmp_path):
         return model, {"target": stage_cfg.compression.target.model_dump()}
 
     def train_fn(model, student, stage_cfg, output_dir):
-        seen.append(("train", stage_cfg.training.token_budget, str(output_dir)))
+        seen.append(("train", stage_cfg.training.token_budget, stage_cfg.training.train_steps, str(output_dir)))
         return {"global_step": stage_cfg.training.train_steps}
 
     result = run_tiny_progressive_stages(teacher, cfg, tmp_path / "progressive", calibrate_fn, compress_fn, train_fn)
@@ -56,8 +56,9 @@ def test_progressive_stage_runner_wires_stage_specific_configs(tmp_path):
     assert [stage["tokens"] for stage in result["stages"]] == [25, 75]
     assert ("compress", 1, 16, 8, str(tmp_path / "progressive" / "stage_1" / "compressed")) in seen
     assert ("compress", 2, 12, 4, str(tmp_path / "progressive" / "stage_2" / "compressed")) in seen
-    assert ("train", 25, str(tmp_path / "progressive" / "stage_1" / "training")) in seen
-    assert ("train", 75, str(tmp_path / "progressive" / "stage_2" / "training")) in seen
+    assert result["global_total_steps"] == 3
+    assert ("train", 25, 1, str(tmp_path / "progressive" / "stage_1" / "training")) in seen
+    assert ("train", 75, 2, str(tmp_path / "progressive" / "stage_2" / "training")) in seen
 
 
 def test_progressive_stage_runner_executes_real_tiny_stages(tmp_path):
@@ -84,4 +85,7 @@ def test_progressive_stage_runner_executes_real_tiny_stages(tmp_path):
     assert stage_1_manifest["stage_provenance"]["stage"] == 1
     assert Path(stage_2_manifest["stage_provenance"]["previous_checkpoint"]).parts[-2:] == ("stage_1", "compressed")
     assert (tmp_path / "real_progressive" / "stage_2" / "training" / "training_report.md").exists()
-    assert result["stages"][1]["training"]["global_step"] == 1
+    assert result["global_total_steps"] == 2
+    assert result["stages"][0]["training"]["global_step"] == 1
+    assert result["stages"][1]["training"]["global_step"] == 2
+    assert result["stages"][1]["global_step_start"] == 1

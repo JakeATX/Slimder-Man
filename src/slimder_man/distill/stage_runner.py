@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import math
 from typing import Callable
 
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
@@ -16,7 +17,7 @@ from slimder_man.distill.train_loop import train_tiny_distill
 
 CalibrationFn = Callable[[TinyMoEForCausalLM, SlimderConfig], CalibrationResult]
 CompressFn = Callable[[TinyMoEForCausalLM, SlimderConfig, CalibrationResult, Path], tuple[TinyMoEForCausalLM, dict]]
-TrainFn = Callable[[TinyMoEForCausalLM, TinyMoEForCausalLM, SlimderConfig, Path], dict]
+TrainFn = Callable[..., dict]
 
 
 def stage_plans_for_tiny(model: TinyMoEForCausalLM, cfg: SlimderConfig) -> list[StagePlan]:
@@ -49,6 +50,19 @@ def config_for_stage(base_cfg: SlimderConfig, plan: StagePlan, teacher: TinyMoEF
     return base_cfg.model_copy(update={"compression": compression, "training": training})
 
 
+def _concrete_int(value: int | str, fallback: int) -> int:
+    return value if isinstance(value, int) else fallback
+
+
+def _stage_train_steps(base_cfg: SlimderConfig, plan: StagePlan) -> int:
+    if base_cfg.training.train_steps <= 0 or plan.tokens <= 0:
+        return 0
+    batch = _concrete_int(base_cfg.training.global_batch_size, _concrete_int(base_cfg.training.micro_batch_size, 1))
+    seq = max(1, base_cfg.training.sequence_length)
+    tokens_per_step = max(1, batch * seq)
+    return max(1, math.ceil(plan.tokens / tokens_per_step))
+
+
 def _default_calibrate(model: TinyMoEForCausalLM, cfg: SlimderConfig) -> CalibrationResult:
     batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
     return collect_tiny_calibration(model, batches)
@@ -67,10 +81,14 @@ def run_tiny_progressive_stages(
     out_dir.mkdir(parents=True, exist_ok=True)
     stages = []
     plans = stage_plans_for_tiny(teacher, cfg)
+    stage_steps = [_stage_train_steps(cfg, plan) for plan in plans]
+    global_total_steps = sum(stage_steps)
+    global_step_offset = 0
     previous_checkpoint: str | None = None
     arch = describe_model(teacher)
-    for plan in plans:
+    for plan, train_steps in zip(plans, stage_steps, strict=True):
         stage_cfg = config_for_stage(cfg, plan, teacher)
+        stage_cfg = stage_cfg.model_copy(update={"training": stage_cfg.training.model_copy(update={"train_steps": train_steps})})
         stage_dir = out_dir / f"stage_{plan.stage}"
         analysis_dir = stage_dir / "analysis"
         _, source_manifest = sample_calibration_tokens(stage_cfg.calibration, vocab_size=teacher.config.vocab_size)
@@ -98,12 +116,27 @@ def run_tiny_progressive_stages(
             if accepts_kwargs or key in signature.parameters
         }
         student, manifest = compress_fn(teacher, stage_cfg, cal, stage_dir / "compressed", **supported_kwargs)
-        train = train_fn(teacher, student, stage_cfg, stage_dir / "training")
+        train_kwargs = {
+            "global_step_offset": global_step_offset,
+            "global_total_steps": global_total_steps,
+        }
+        train_signature = inspect.signature(train_fn)
+        train_accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in train_signature.parameters.values())
+        supported_train_kwargs = {
+            key: value
+            for key, value in train_kwargs.items()
+            if train_accepts_kwargs or key in train_signature.parameters
+        }
+        train = train_fn(teacher, student, stage_cfg, stage_dir / "training", **supported_train_kwargs)
+        global_step_offset += train_steps
         previous_checkpoint = str(stage_dir / "compressed")
         stages.append(
             {
                 "stage": plan.stage,
                 "tokens": plan.tokens,
+                "train_steps": train_steps,
+                "global_step_start": global_step_offset - train_steps,
+                "global_step_end": global_step_offset,
                 "analysis": str(analysis_dir),
                 "checkpoint": str(stage_dir / "compressed"),
                 "training": train,
@@ -113,6 +146,7 @@ def run_tiny_progressive_stages(
         )
     return {
         "stages": stages,
+        "global_total_steps": global_total_steps,
         "final_checkpoint": stages[-1]["checkpoint"] if stages else None,
         "final_training_checkpoint": stages[-1]["training"].get("checkpoint") if stages else None,
     }

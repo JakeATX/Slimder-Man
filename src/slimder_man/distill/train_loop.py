@@ -15,7 +15,15 @@ from slimder_man.distill.schedules import cosine_schedule, global_cosine_lr, lin
 from slimder_man.utils.determinism import set_seed
 
 
-def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM, cfg: SlimderConfig, output_dir: str | Path, resume: bool = False) -> dict:
+def train_tiny_distill(
+    teacher: TinyMoEForCausalLM,
+    student: TinyMoEForCausalLM,
+    cfg: SlimderConfig,
+    output_dir: str | Path,
+    resume: bool = False,
+    global_step_offset: int = 0,
+    global_total_steps: int | None = None,
+) -> dict:
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "trainer_state.json"
@@ -26,7 +34,9 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
         set_seed(cfg.project.seed)
     if resume and state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        start_step = state.get("global_step", 0)
+        start_step = state.get("stage_step")
+        if start_step is None:
+            start_step = max(0, state.get("global_step", 0) - global_step_offset)
         logs = list(state.get("logs", []))
         rng_path = out_dir / "rng_state.pt"
         if rng_path.exists():
@@ -40,18 +50,26 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
     if resume and opt_path.exists():
         opt.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
     total_steps = cfg.training.train_steps
+    schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
     for step in range(start_step, total_steps):
         batch = batches[step % len(batches)]
-        lr = global_cosine_lr(cfg.training.learning_rate, cfg.training.min_learning_rate, cfg.training.warmup_steps, step, total_steps)
+        schedule_step = global_step_offset + step
+        lr = global_cosine_lr(
+            cfg.training.learning_rate,
+            cfg.training.min_learning_rate,
+            cfg.training.warmup_steps,
+            schedule_step,
+            schedule_total_steps,
+        )
         for group in opt.param_groups:
             group["lr"] = lr
         with torch.no_grad():
             teacher_out = teacher(batch)
         student_out = student(batch)
-        lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, step, total_steps)
-        beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, step, total_steps)
+        lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, schedule_step, schedule_total_steps)
+        beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, schedule_step, schedule_total_steps)
         loss, parts = total_distill_loss(
             student_out,
             teacher_out,
@@ -68,7 +86,15 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
         torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.training.max_grad_norm)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        row = {"step": step + 1, "loss": float(loss.detach()), "lambda": lambda_t, "beta": beta_t, "lr": lr, **parts}
+        row = {
+            "step": schedule_step + 1,
+            "stage_step": step + 1,
+            "loss": float(loss.detach()),
+            "lambda": lambda_t,
+            "beta": beta_t,
+            "lr": lr,
+            **parts,
+        }
         logs.append(row)
         torch.save(opt.state_dict(), opt_path)
         student.save_pretrained(resume_model_dir)
@@ -83,7 +109,10 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
         state_path.write_text(
             json.dumps(
                 {
-                    "global_step": step + 1,
+                    "global_step": schedule_step + 1,
+                    "stage_step": step + 1,
+                    "global_step_offset": global_step_offset,
+                    "global_total_steps": schedule_total_steps,
                     "logs": logs,
                     "config": cfg.model_dump(mode="json"),
                     "optimizer_state": str(opt_path),
@@ -99,7 +128,13 @@ def train_tiny_distill(teacher: TinyMoEForCausalLM, student: TinyMoEForCausalLM,
     for row in logs:
         report.append(json.dumps(row, sort_keys=True))
     (out_dir / "training_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
-    return {"global_step": total_steps, "logs": logs, "checkpoint": str(out_dir / "final")}
+    return {
+        "global_step": global_step_offset + total_steps,
+        "stage_steps": total_steps,
+        "global_total_steps": schedule_total_steps,
+        "logs": logs,
+        "checkpoint": str(out_dir / "final"),
+    }
 
 
 def train_causal_lm_distill(
@@ -109,6 +144,8 @@ def train_causal_lm_distill(
     output_dir: str | Path,
     batches: list[torch.Tensor],
     resume: bool = False,
+    global_step_offset: int = 0,
+    global_total_steps: int | None = None,
 ) -> dict:
     """Small generic HF-style distillation loop used by non-tiny smoke fixtures."""
     out_dir = Path(output_dir)
@@ -120,7 +157,9 @@ def train_causal_lm_distill(
         set_seed(cfg.project.seed)
     if resume and state_path.exists():
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        start_step = state.get("global_step", 0)
+        start_step = state.get("stage_step")
+        if start_step is None:
+            start_step = max(0, state.get("global_step", 0) - global_step_offset)
         logs = list(state.get("logs", []))
         rng_path = out_dir / "rng_state.pt"
         if rng_path.exists():
@@ -135,18 +174,26 @@ def train_causal_lm_distill(
         opt.load_state_dict(torch.load(opt_path, map_location="cpu", weights_only=True))
 
     total_steps = cfg.training.train_steps
+    schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
     for step in range(start_step, total_steps):
         batch = batches[step % len(batches)]
-        lr = global_cosine_lr(cfg.training.learning_rate, cfg.training.min_learning_rate, cfg.training.warmup_steps, step, total_steps)
+        schedule_step = global_step_offset + step
+        lr = global_cosine_lr(
+            cfg.training.learning_rate,
+            cfg.training.min_learning_rate,
+            cfg.training.warmup_steps,
+            schedule_step,
+            schedule_total_steps,
+        )
         for group in opt.param_groups:
             group["lr"] = lr
         with torch.no_grad():
             teacher_out = teacher(input_ids=batch)
         student_out = student(input_ids=batch)
-        lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, step, total_steps)
-        beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, step, total_steps)
+        lambda_t = linear_schedule(cfg.kd.lambda_schedule.start, cfg.kd.lambda_schedule.end, schedule_step, schedule_total_steps)
+        beta_t = cosine_schedule(cfg.kd.mtp.beta_schedule.start, cfg.kd.mtp.beta_schedule.end, schedule_step, schedule_total_steps)
         loss, parts = total_distill_loss(
             student_out,
             teacher_out,
@@ -163,7 +210,15 @@ def train_causal_lm_distill(
         torch.nn.utils.clip_grad_norm_(student.parameters(), cfg.training.max_grad_norm)
         opt.step()
         opt.zero_grad(set_to_none=True)
-        row = {"step": step + 1, "loss": float(loss.detach()), "lambda": lambda_t, "beta": beta_t, "lr": lr, **parts}
+        row = {
+            "step": schedule_step + 1,
+            "stage_step": step + 1,
+            "loss": float(loss.detach()),
+            "lambda": lambda_t,
+            "beta": beta_t,
+            "lr": lr,
+            **parts,
+        }
         logs.append(row)
         torch.save(opt.state_dict(), opt_path)
         if hasattr(student, "save_pretrained"):
@@ -179,7 +234,10 @@ def train_causal_lm_distill(
         state_path.write_text(
             json.dumps(
                 {
-                    "global_step": step + 1,
+                    "global_step": schedule_step + 1,
+                    "stage_step": step + 1,
+                    "global_step_offset": global_step_offset,
+                    "global_total_steps": schedule_total_steps,
                     "logs": logs,
                     "config": cfg.model_dump(mode="json"),
                     "optimizer_state": str(opt_path),
@@ -197,4 +255,10 @@ def train_causal_lm_distill(
     for row in logs:
         report.append(json.dumps(row, sort_keys=True))
     (out_dir / "training_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")
-    return {"global_step": total_steps, "logs": logs, "checkpoint": str(out_dir / "final")}
+    return {
+        "global_step": global_step_offset + total_steps,
+        "stage_steps": total_steps,
+        "global_total_steps": schedule_total_steps,
+        "logs": logs,
+        "checkpoint": str(out_dir / "final"),
+    }

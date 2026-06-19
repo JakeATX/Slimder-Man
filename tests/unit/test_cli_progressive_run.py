@@ -14,7 +14,7 @@ def test_cli_run_executes_progressive_tiny_stages(tmp_path: Path):
         project={"output_dir": str(tmp_path / "run")},
         progressive={"schedule": "depth_first", "stages": 2, "token_split": [0.5, 0.5]},
         calibration={"sample_count": 4, "sequence_length": 8},
-        training={"token_budget": 32, "train_steps": 1, "warmup_steps": 0},
+        training={"token_budget": 32, "train_steps": 1, "warmup_steps": 2},
         compression={"target": {"hidden_size": 12, "remove_last_n_layers": 2, "routed_experts": 4, "routed_top_k": 2}},
     )
     config_path = tmp_path / "config.yaml"
@@ -25,8 +25,15 @@ def test_cli_run_executes_progressive_tiny_stages(tmp_path: Path):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     stages = payload["progressive"]["stages"]
+    assert payload["progressive"]["global_total_steps"] == 2
     assert [stage["stage"] for stage in stages] == [1, 2]
     assert [stage["tokens"] for stage in stages] == [16, 16]
+    assert [stage["train_steps"] for stage in stages] == [1, 1]
+    assert [stage["global_step_start"] for stage in stages] == [0, 1]
+    assert [stage["global_step_end"] for stage in stages] == [1, 2]
+    assert stages[0]["training"]["logs"][0]["step"] == 1
+    assert stages[1]["training"]["logs"][0]["step"] == 2
+    assert stages[1]["training"]["logs"][0]["lr"] > stages[0]["training"]["logs"][0]["lr"]
     assert stages[0]["manifest"]["target"]["hidden_size"] == 16
     assert stages[0]["manifest"]["target"]["remove_last_n_layers"] == 1
     assert stages[0]["manifest"]["target"]["routed_experts"] == 8
