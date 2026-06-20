@@ -27,8 +27,8 @@ from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_d
 from slimder_man.distill.stage_runner import run_tiny_progressive_stages
 from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.local import local_dry_run_commands
-from slimder_man.orchestration.skypilot import skypilot_yaml
-from slimder_man.orchestration.ssh import ssh_dry_run_commands
+from slimder_man.orchestration.skypilot import SkyPilotRunner, skypilot_yaml
+from slimder_man.orchestration.ssh import SSHRunner, ssh_dry_run_commands
 from slimder_man.quant.export import write_quant_export_manifest
 from slimder_man.quant.fake_backend import fake_quantize_model
 from slimder_man.ui.app import create_app
@@ -623,9 +623,32 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
         plan = local_dry_run_commands(config, cfg)
         result = {"backend": "local", "commands": plan.commands, "preflight": plan.preflight, "output_dir": plan.output_dir}
     elif backend == "ssh":
-        result = {"backend": "ssh", "commands": ssh_dry_run_commands(config, cfg).commands}
+        if cfg.runtime.ssh.dry_run:
+            result = {"backend": "ssh", "dry_run": True, "commands": ssh_dry_run_commands(config, cfg).commands}
+        else:
+            run = SSHRunner(config, cfg).launch()
+            result = {
+                "backend": run.backend,
+                "dry_run": run.dry_run,
+                "status": run.status,
+                "commands": run.commands,
+                "failed_command": run.failed_command,
+                "results": [r.__dict__ for r in run.results],
+            }
     elif backend == "skypilot":
-        result = {"backend": "skypilot", "yaml": skypilot_yaml(config, cfg)}
+        if cfg.runtime.skypilot.dry_run:
+            result = {"backend": "skypilot", "dry_run": True, "yaml": skypilot_yaml(config, cfg)}
+        else:
+            run = SkyPilotRunner(config, cfg).launch()
+            result = {
+                "backend": run.backend,
+                "dry_run": run.dry_run,
+                "status": run.status,
+                "task_path": run.task_path,
+                "commands": run.commands,
+                "failed_command": run.failed_command,
+                "results": [r.__dict__ for r in run.results],
+            }
     else:
         result = {"backend": backend, "status": "unsupported"}
     _echo(result, json_output)

@@ -204,6 +204,9 @@ class RuntimeSkyPilotConfig(StrictBaseModel):
     cluster_name: str = "slimder"
     accelerators: str = "H100:8"
     cloud: str = "auto"
+    region: str | None = None
+    image_id: str | None = None
+    disk_size_gb: int = 512
     autostop_minutes: int = 60
     dry_run: bool = True
 

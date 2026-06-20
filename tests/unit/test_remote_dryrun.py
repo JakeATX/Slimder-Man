@@ -9,7 +9,7 @@ from slimder_man.config.schema import SlimderConfig, save_config
 from slimder_man.orchestration.jobs import CommandResult
 from slimder_man.orchestration.local import local_dry_run_commands, local_preflight
 from slimder_man.orchestration.materialize_config import materialize_remote_config
-from slimder_man.orchestration.skypilot import skypilot_yaml
+from slimder_man.orchestration.skypilot import SkyPilotRunner, skypilot_plan, skypilot_yaml
 from slimder_man.orchestration.ssh import SSHRunner, ssh_command_plan, ssh_dry_run_commands
 from slimder_man.utils.hashing import redact_secret
 
@@ -78,6 +78,64 @@ def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
     assert "HF_TOKEN" in yml
     assert "hf_***REDACTED***" in redact_secret("token=hf_abcdef123")
     assert "hf_dummy.yaml" in redact_secret("src/slimder_man/config/examples/hf_dummy.yaml")
+
+
+def test_skypilot_yaml_includes_resource_overrides_and_runner_commands(tmp_path: Path):
+    config_path = tmp_path / "launch.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run out")},
+        runtime={
+            "skypilot": {
+                "cluster_name": "slimder-test",
+                "accelerators": "A100:1",
+                "cloud": "gcp",
+                "region": "us-central1",
+                "image_id": "docker:python:3.12",
+                "disk_size_gb": 256,
+                "dry_run": True,
+            }
+        },
+    )
+    save_config(cfg, config_path)
+
+    yml = yaml.safe_load(skypilot_yaml(config_path, cfg))
+    plan = skypilot_plan(config_path, cfg, task_path=tmp_path / "task file.yaml")
+
+    assert yml["resources"]["accelerators"] == "A100:1"
+    assert yml["resources"]["infra"] == "gcp"
+    assert yml["resources"]["region"] == "us-central1"
+    assert yml["resources"]["image_id"] == "docker:python:3.12"
+    assert yml["resources"]["disk_size"] == 256
+    assert "sky launch -c slimder-test" in plan.launch_command
+    assert "task file.yaml" in plan.launch_command
+    assert "sky logs slimder-test --follow" == plan.logs_command
+    assert "sky stop slimder-test --yes" == plan.stop_command
+    assert "sky rsync-down slimder-test outputs/run-out/" in plan.sync_command
+
+
+def test_skypilot_runner_launches_streams_and_syncs_with_fake_executor(tmp_path: Path):
+    config_path = tmp_path / "launch.yaml"
+    task_path = tmp_path / "task file.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run out")},
+        runtime={"skypilot": {"cluster_name": "slimder-test", "dry_run": False}},
+    )
+    save_config(cfg, config_path)
+    executor = RecordingExecutor()
+    runner = SkyPilotRunner(config_path, cfg, executor=executor, task_path=task_path)
+
+    result = runner.launch()
+    logs = list(runner.stream_logs())
+    stop = runner.stop()
+    sync = runner.sync_outputs()
+
+    assert result.status == "succeeded"
+    assert task_path.exists()
+    assert "slimder_man.cli analyze" in task_path.read_text(encoding="utf-8")
+    assert executor.commands[0].startswith("sky launch -c slimder-test")
+    assert logs == ["log-line-1", "token=hf_***REDACTED***"]
+    assert stop.ok and executor.commands[2] == "sky stop slimder-test --yes"
+    assert sync.ok and executor.commands[3].startswith("sky rsync-down slimder-test")
 
 
 def test_ssh_plan_syncs_resolved_repo_root_and_quotes_excludes(tmp_path: Path):
