@@ -14,6 +14,7 @@ from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig, load_config
 from slimder_man.distill.losses import total_distill_loss
+from slimder_man.distill.offline_cache import OfflineFullLogitsCache
 from slimder_man.distill.remote_worker import RemoteWorkerLogitsClient
 from slimder_man.distill.schedules import cosine_schedule, global_cosine_lr, linear_schedule
 from slimder_man.utils.determinism import set_seed
@@ -67,17 +68,24 @@ def _microbatch_from_samples(batches: list[torch.Tensor], start: int, micro_batc
 
 
 def _validate_teacher_mode(cfg: SlimderConfig) -> None:
-    if cfg.kd.teacher_mode not in {"online_full_logits", "remote_worker_full_logits"}:
+    if cfg.kd.teacher_mode not in {"online_full_logits", "offline_full_logits_cache", "remote_worker_full_logits"}:
         raise ValueError(
-            "Local trainer currently supports kd.teacher_mode=online_full_logits or remote_worker_full_logits; "
+            "Local trainer currently supports kd.teacher_mode=online_full_logits, offline_full_logits_cache, "
+            "or remote_worker_full_logits; "
             f"got {cfg.kd.teacher_mode}."
         )
 
 
 def _teacher_logits_client(cfg: SlimderConfig, teacher_logits_client: TeacherLogitsClient | None) -> TeacherLogitsClient | None:
-    if cfg.kd.teacher_mode != "remote_worker_full_logits":
-        return None
-    return teacher_logits_client or RemoteWorkerLogitsClient.from_config(cfg.runtime.worker)
+    if teacher_logits_client is not None:
+        return teacher_logits_client
+    if cfg.kd.teacher_mode == "remote_worker_full_logits":
+        return RemoteWorkerLogitsClient.from_config(cfg.runtime.worker)
+    if cfg.kd.teacher_mode == "offline_full_logits_cache":
+        if not cfg.kd.offline_full_logits_cache_path:
+            raise ValueError("kd.offline_full_logits_cache_path is required for kd.teacher_mode=offline_full_logits_cache")
+        return OfflineFullLogitsCache.from_path(cfg.kd.offline_full_logits_cache_path)
+    return None
 
 
 def _teacher_output(teacher, input_ids: torch.Tensor, client: TeacherLogitsClient | None):
