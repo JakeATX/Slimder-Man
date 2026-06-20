@@ -29,6 +29,7 @@ from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.local import local_dry_run_commands
 from slimder_man.orchestration.skypilot import SkyPilotRunner, skypilot_yaml
 from slimder_man.orchestration.ssh import SSHRunner, ssh_dry_run_commands
+from slimder_man.orchestration.worker_client import WorkerAPIRunner
 from slimder_man.quant.export import write_quant_export_manifest
 from slimder_man.quant.fake_backend import fake_quantize_model
 from slimder_man.ui.app import create_app
@@ -637,6 +638,15 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
                 "failed_command": run.failed_command,
                 "results": [r.__dict__ for r in run.results],
             }
+    elif backend == "worker":
+        run = WorkerAPIRunner(config, cfg).launch(dry_run=False)
+        result = {
+            "backend": run.backend,
+            "status": run.status,
+            "api_url": run.api_url,
+            "job": run.job,
+            "dry_run": run.dry_run,
+        }
     else:
         result = {"backend": backend, "status": "unsupported"}
     _echo(result, json_output)
@@ -644,14 +654,21 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
 
 @app.command()
 def worker(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 7861,
     teacher_model: str | None = None,
     auth_token: str | None = typer.Option(None, "--auth-token", help="Bearer token required for /v1 worker endpoints."),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
+    auth_required = bool(auth_token or os.environ.get("SLIMDER_WORKER_TOKEN"))
+    public_bind = host not in {"127.0.0.1", "localhost", "::1"}
+    if public_bind and not auth_required:
+        raise typer.BadParameter(
+            "slimder worker refuses non-local bind without auth. Set --auth-token or SLIMDER_WORKER_TOKEN, "
+            "or bind to 127.0.0.1 for local-only development."
+        )
     if json_output:
-        _echo({"host": host, "port": port, "auth_required": bool(auth_token or os.environ.get("SLIMDER_WORKER_TOKEN")), "endpoints": ["/v1/preflight", "/v1/jobs", "/v1/teacher_logits", "/healthz"]}, True)
+        _echo({"host": host, "port": port, "auth_required": auth_required, "endpoints": ["/v1/preflight", "/v1/jobs", "/v1/teacher_logits", "/healthz"]}, True)
         return
     import uvicorn
 

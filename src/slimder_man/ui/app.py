@@ -290,7 +290,7 @@ def create_app(test_mode: bool = False):
                 eval_btn = gr.Button("Run Evaluation")
                 eval_out = gr.Code(language="json", label="Evaluation Output")
             with gr.Tab("Artifacts"):
-                launch_backend = gr.Dropdown(["local", "ssh", "skypilot"], value="local", label="Launch backend")
+                launch_backend = gr.Dropdown(["local", "ssh", "skypilot", "worker"], value="local", label="Launch backend")
                 launch_btn = gr.Button("Launch / Dry Run")
                 launch_out = gr.Code(language="json", label="Launch Output")
                 artifacts_btn = gr.Button("Refresh Artifacts")

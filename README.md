@@ -58,12 +58,19 @@ Remote launch planning:
 ```bash
 slimder launch src/slimder_man/config/examples/hf_dummy.yaml --backend ssh --json
 slimder launch src/slimder_man/config/examples/hf_dummy.yaml --backend skypilot --json
-slimder worker --auth-token change-me --json
+slimder launch path/to/worker_config.yaml --backend worker --json
+slimder worker --json
+slimder worker --host 0.0.0.0 --auth-token change-me
 ```
 
 For SSH/SkyPilot configs, `runtime.ssh.dry_run=false` or
 `runtime.skypilot.dry_run=false` switches `slimder launch` from plan generation
 to the executable runner path.
+For worker configs, set `runtime.worker.api_url` to a running `slimder worker`
+service; launch submits the YAML as job input so the worker does not need a
+shared local config path. Worker defaults to `127.0.0.1`; non-local binds
+require `--auth-token` or `SLIMDER_WORKER_TOKEN` because `/v1/jobs` executes
+local subprocesses.
 
 The package targets Python `>=3.11,<3.13`.
 GitHub Actions runs unit and non-GPU smoke tests on Python 3.11 and 3.12.

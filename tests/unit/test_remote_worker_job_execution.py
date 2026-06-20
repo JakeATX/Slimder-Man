@@ -1,15 +1,18 @@
+import json
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from slimder_man.cli import app
 from slimder_man.config.schema import SlimderConfig, save_config
 from slimder_man.distill.remote_worker import RemoteWorkerLogitsClient
+from slimder_man.orchestration.worker_client import WorkerAPIClient, WorkerAPIRunner
 from slimder_man.orchestration.worker_api import create_worker_app
 
 
@@ -90,6 +93,34 @@ def test_worker_run_command_uses_slimder_cli_with_positional_config(tmp_path: Pa
     logs = client.get(f"/v1/jobs/{created['id']}/logs").json()["logs"]
     assert any('"status": "dry_run"' in line for line in logs)
     assert str((tmp_path / "out").resolve()) in finished["artifact_paths"]
+
+
+def test_worker_job_api_materializes_config_text_for_remote_launch(tmp_path: Path):
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path / "remote out")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy/full-model-dry-run"},
+    )
+    client = TestClient(create_worker_app(job_root=tmp_path / "worker"))
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "command": "run",
+            "config_text": yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False),
+            "config_filename": "remote.yaml",
+            "args": ["--dry-run", "--json"],
+        },
+    ).json()
+
+    finished = _wait_for_terminal(client, created["id"])
+    assert finished["status"] == "succeeded"
+    request = finished["request"]
+    assert request["config_text"] is None
+    assert request["config_path"].endswith("remote.yaml")
+    assert Path(request["config_path"]).exists()
+    assert str((tmp_path / "remote out").resolve()) in finished["artifact_paths"]
+    logs = client.get(f"/v1/jobs/{created['id']}/logs").json()["logs"]
+    assert any('"status": "dry_run"' in line for line in logs)
 
 
 def test_worker_auth_guards_v1_endpoints_and_accepts_bearer_token(tmp_path: Path):
@@ -195,10 +226,95 @@ def test_remote_worker_logits_client_rejects_shape_mismatch(monkeypatch):
         raise AssertionError("client should reject malformed binary logits payloads")
 
 
+def test_worker_api_runner_submits_config_text_and_redacts_token(tmp_path: Path):
+    config_path = tmp_path / "worker.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        runtime={"worker": {"api_url": "http://worker.example", "auth_token": "hf_secret123"}},
+    )
+    save_config(cfg, config_path)
+    captured = {}
+
+    class FakeClient(WorkerAPIClient):
+        def __init__(self):
+            super().__init__("http://worker.example", auth_token="hf_secret123")
+
+        def create_job(self, payload):
+            captured["payload"] = payload
+            return {"id": "job-1", "status": "running", "token": "hf_secret123"}
+
+    result = WorkerAPIRunner(config_path, cfg, client=FakeClient()).launch()
+
+    assert result.status == "running"
+    assert result.job["token"] == "hf_***REDACTED***"
+    assert captured["payload"]["command"] == "run"
+    assert captured["payload"]["config_filename"] == "worker.yaml"
+    assert "paper_faithful: false" in captured["payload"]["config_text"]
+    assert captured["payload"]["args"] == ["--json"]
+
+
+def test_worker_api_runner_dry_run_summarizes_config_text(tmp_path: Path):
+    config_path = tmp_path / "worker.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        runtime={"worker": {"api_url": "http://worker.example", "auth_token": "plain-secret"}},
+    )
+    save_config(cfg, config_path)
+
+    result = WorkerAPIRunner(config_path, cfg, client=WorkerAPIClient("http://worker.example")).launch(dry_run=True)
+
+    assert result.dry_run is True
+    assert result.request_payload is not None
+    assert "config_text" not in result.request_payload
+    assert result.request_payload["config_text_bytes"] > 0
+
+
+def test_cli_launch_worker_uses_worker_api_runner(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "worker.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        runtime={"worker": {"api_url": "http://worker.example"}},
+    )
+    save_config(cfg, config_path)
+    captured = {}
+
+    class FakeRunner:
+        def __init__(self, config, cfg):
+            captured["config"] = config
+            captured["cfg"] = cfg
+
+        def launch(self, dry_run=False):
+            captured["dry_run"] = dry_run
+            return type(
+                "Run",
+                (),
+                {
+                    "backend": "worker",
+                    "status": "running",
+                    "api_url": "http://worker.example",
+                    "job": {"id": "job-1", "status": "running"},
+                    "dry_run": dry_run,
+                },
+            )()
+
+    monkeypatch.setattr("slimder_man.cli.WorkerAPIRunner", FakeRunner)
+
+    result = CliRunner().invoke(app, ["launch", str(config_path), "--backend", "worker", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["backend"] == "worker"
+    assert payload["job"]["id"] == "job-1"
+    assert captured["config"] == config_path
+    assert captured["cfg"].runtime.worker.api_url == "http://worker.example"
+    assert captured["dry_run"] is False
+
+
 def test_worker_cli_json_reports_auth_requirement():
     result = CliRunner().invoke(app, ["worker", "--auth-token", "secret-token", "--json"])
 
     assert result.exit_code == 0, result.output
+    assert '"host": "127.0.0.1"' in result.output
     assert '"auth_required": true' in result.output
 
 
@@ -208,4 +324,21 @@ def test_worker_cli_json_reports_env_auth_requirement(monkeypatch):
     result = CliRunner().invoke(app, ["worker", "--json"])
 
     assert result.exit_code == 0, result.output
+    assert '"auth_required": true' in result.output
+
+
+def test_worker_cli_rejects_public_bind_without_auth(monkeypatch):
+    monkeypatch.delenv("SLIMDER_WORKER_TOKEN", raising=False)
+
+    result = CliRunner().invoke(app, ["worker", "--host", "0.0.0.0", "--json"])
+
+    assert result.exit_code != 0
+    assert "refuses non-local bind without auth" in result.output
+
+
+def test_worker_cli_allows_public_bind_with_auth():
+    result = CliRunner().invoke(app, ["worker", "--host", "0.0.0.0", "--auth-token", "secret-token", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert '"host": "0.0.0.0"' in result.output
     assert '"auth_required": true' in result.output

@@ -21,6 +21,8 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 
 class WorkerJobRequest(BaseModel):
     config_path: str | None = None
+    config_text: str | None = None
+    config_filename: str = "launch_config.yaml"
     command: str = "run"
     args: list[str] = Field(default_factory=list)
     cwd: str | None = None
@@ -45,6 +47,7 @@ class WorkerJobStore:
 
     def create(self, req: WorkerJobRequest) -> dict[str, Any]:
         job_id = uuid.uuid4().hex
+        req = self._materialize_config_text(job_id, req)
         now = time.time()
         job = {
             "id": job_id,
@@ -61,6 +64,16 @@ class WorkerJobStore:
         }
         self._write(job)
         return job
+
+    def _materialize_config_text(self, job_id: str, req: WorkerJobRequest) -> WorkerJobRequest:
+        if req.config_text is None:
+            return req
+        config_dir = self.jobs_dir / job_id
+        config_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(req.config_filename).name or "launch_config.yaml"
+        config_path = config_dir / safe_name
+        config_path.write_text(req.config_text, encoding="utf-8")
+        return req.model_copy(update={"config_path": str(config_path), "config_text": None})
 
     def start(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
