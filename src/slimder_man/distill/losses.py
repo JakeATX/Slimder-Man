@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch.nn import functional as F
 
-from .mtp import align_mtp_logits, align_teacher_logits_for_mtp, mtp_labels
+from .mtp import align_mtp_training_tensors
 
 
 def kd_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -28,10 +28,8 @@ def mtp_losses(student_mtp_logits: list[torch.Tensor], teacher_logits: torch.Ten
     for i, logits in enumerate(student_mtp_logits, start=1):
         if logits.shape[1] <= i:
             continue
-        aligned = align_mtp_logits(logits, i)
-        labels = mtp_labels(input_ids, i)
+        aligned, labels, teacher_aligned = align_mtp_training_tensors(logits, input_ids, teacher_logits, i)
         lm_terms.append(F.cross_entropy(aligned.reshape(-1, aligned.shape[-1]), labels.reshape(-1)))
-        teacher_aligned = align_teacher_logits_for_mtp(teacher_logits, i)
         q = torch.softmax(teacher_aligned / temperature, dim=-1)
         log_p = torch.log_softmax(aligned / temperature, dim=-1)
         kd_terms.append(-(q * log_p).sum(dim=-1).mean() * (temperature**2))
