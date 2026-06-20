@@ -575,11 +575,6 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
     model, kind = _load_checkpoint_auto(checkpoint)
     target_bits = cfg.quantization.target_avg_bits or 8.0
     fake_manifest = fake_quantize_model(model, out_dir, target_avg_bits=target_bits, safe_serialization=cfg.student.output_format == "hf_safetensors")
-    artifact_hashes = {
-        name: sha256_file(out_dir / name)
-        for name in ("model.pt", "model.safetensors", "pytorch_model.bin", "config.json", "fake_quant_manifest.json")
-        if (out_dir / name).exists()
-    }
     manifest = {
         "mode": cfg.quantization.mode,
         "backend": fake_manifest["backend"],
@@ -591,16 +586,9 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
         "protected_modules": ["router", "gate", "norm", "embed_tokens", "lm_head", "shared"],
         "fake_quant_manifest": "fake_quant_manifest.json",
         "export_manifest": "quant_export_manifest.json",
-        "artifact_hashes": artifact_hashes,
+        "artifact_hashes": {},
         "note": fake_manifest["note"],
     }
-    write_json(out_dir / "quantization_manifest.json", manifest)
-    write_quant_export_manifest(
-        out_dir,
-        manifest["backend"],
-        fake_manifest,
-        source_checkpoint=str(checkpoint),
-    )
     manifest["artifact_hashes"] = {
         name: sha256_file(out_dir / name)
         for name in ("model.pt", "model.safetensors", "pytorch_model.bin", "config.json", "fake_quant_manifest.json")
