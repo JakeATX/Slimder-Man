@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -13,8 +14,14 @@ from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig, load_config
 from slimder_man.distill.losses import total_distill_loss
+from slimder_man.distill.remote_worker import RemoteWorkerLogitsClient
 from slimder_man.distill.schedules import cosine_schedule, global_cosine_lr, linear_schedule
 from slimder_man.utils.determinism import set_seed
+
+
+class TeacherLogitsClient(Protocol):
+    def teacher_output(self, input_ids: torch.Tensor):
+        ...
 
 
 def _concrete_int(value: int | str, fallback: int) -> int:
@@ -60,11 +67,26 @@ def _microbatch_from_samples(batches: list[torch.Tensor], start: int, micro_batc
 
 
 def _validate_teacher_mode(cfg: SlimderConfig) -> None:
-    if cfg.kd.teacher_mode != "online_full_logits":
+    if cfg.kd.teacher_mode not in {"online_full_logits", "remote_worker_full_logits"}:
         raise ValueError(
-            f"Local trainer currently supports kd.teacher_mode=online_full_logits only; got {cfg.kd.teacher_mode}. "
-            "Use a remote worker or cache-generation path once that backend is configured."
+            "Local trainer currently supports kd.teacher_mode=online_full_logits or remote_worker_full_logits; "
+            f"got {cfg.kd.teacher_mode}."
         )
+
+
+def _teacher_logits_client(cfg: SlimderConfig, teacher_logits_client: TeacherLogitsClient | None) -> TeacherLogitsClient | None:
+    if cfg.kd.teacher_mode != "remote_worker_full_logits":
+        return None
+    return teacher_logits_client or RemoteWorkerLogitsClient.from_config(cfg.runtime.worker)
+
+
+def _teacher_output(teacher, input_ids: torch.Tensor, client: TeacherLogitsClient | None):
+    if client is not None:
+        return client.teacher_output(input_ids)
+    try:
+        return teacher(input_ids=input_ids)
+    except TypeError:
+        return teacher(input_ids)
 
 
 def _mean_parts(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -89,8 +111,10 @@ def train_tiny_distill(
     resume: bool = False,
     global_step_offset: int = 0,
     global_total_steps: int | None = None,
+    teacher_logits_client: TeacherLogitsClient | None = None,
 ) -> dict:
     _validate_teacher_mode(cfg)
+    remote_client = _teacher_logits_client(cfg, teacher_logits_client)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "trainer_state.json"
@@ -146,7 +170,7 @@ def train_tiny_distill(
                 micro_batch_size,
             )
             with torch.no_grad():
-                teacher_out = teacher(micro_batch)
+                teacher_out = _teacher_output(teacher, micro_batch, remote_client)
             student_out = student(micro_batch)
             loss, parts = total_distill_loss(
                 student_out,
@@ -233,9 +257,11 @@ def train_causal_lm_distill(
     resume: bool = False,
     global_step_offset: int = 0,
     global_total_steps: int | None = None,
+    teacher_logits_client: TeacherLogitsClient | None = None,
 ) -> dict:
     """Small generic HF-style distillation loop used by non-tiny smoke fixtures."""
     _validate_teacher_mode(cfg)
+    remote_client = _teacher_logits_client(cfg, teacher_logits_client)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_path = out_dir / "trainer_state.json"
@@ -291,7 +317,7 @@ def train_causal_lm_distill(
                 micro_batch_size,
             )
             with torch.no_grad():
-                teacher_out = teacher(input_ids=micro_batch)
+                teacher_out = _teacher_output(teacher, micro_batch, remote_client)
             student_out = student(input_ids=micro_batch)
             loss, parts = total_distill_loss(
                 student_out,

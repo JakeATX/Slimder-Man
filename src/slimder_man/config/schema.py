@@ -211,6 +211,13 @@ class RuntimeSkyPilotConfig(StrictBaseModel):
     dry_run: bool = True
 
 
+class RuntimeWorkerConfig(StrictBaseModel):
+    api_url: str | None = None
+    auth_token: str | None = None
+    auth_token_env: str | None = "SLIMDER_WORKER_TOKEN"
+    timeout_seconds: float = 60.0
+
+
 class TrackingConfig(StrictBaseModel):
     backend: Literal["tensorboard", "wandb", "mlflow", "none"] = "tensorboard"
 
@@ -220,6 +227,7 @@ class RuntimeConfig(StrictBaseModel):
     local: RuntimeLocalConfig = Field(default_factory=RuntimeLocalConfig)
     ssh: RuntimeSSHConfig = Field(default_factory=RuntimeSSHConfig)
     skypilot: RuntimeSkyPilotConfig = Field(default_factory=RuntimeSkyPilotConfig)
+    worker: RuntimeWorkerConfig = Field(default_factory=RuntimeWorkerConfig)
     tracking: TrackingConfig = Field(default_factory=TrackingConfig)
 
 

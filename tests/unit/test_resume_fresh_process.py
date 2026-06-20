@@ -37,6 +37,24 @@ class AuxLossDummyHfMoeForCausalLM(DummyHfMoeForCausalLM):
         )()
 
 
+class RaisingTeacher(DummyHfMoeForCausalLM):
+    def forward(self, input_ids, labels=None):
+        raise AssertionError("remote_worker_full_logits must not call local teacher forward")
+
+
+class FakeWorkerLogitsClient:
+    def __init__(self, vocab_size: int):
+        self.vocab_size = vocab_size
+        self.calls: list[tuple[int, int]] = []
+
+    def teacher_output(self, input_ids):
+        self.calls.append(tuple(input_ids.shape))
+        batch, seq = input_ids.shape
+        logits = input_ids.new_zeros((batch, seq, self.vocab_size)).float()
+        logits[..., 0] = 1.0
+        return type("RemoteTeacherOutput", (), {"logits": logits})()
+
+
 def test_generic_distill_resume_restores_state_with_fresh_model_instance(tmp_path: Path):
     teacher = DummyHfMoeForCausalLM()
     student = DummyHfMoeForCausalLM()
@@ -184,8 +202,49 @@ def test_generic_distill_rejects_unsupported_teacher_modes(tmp_path: Path):
     )
     batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
 
-    with pytest.raises(ValueError, match="online_full_logits only"):
+    with pytest.raises(ValueError, match="online_full_logits or remote_worker_full_logits"):
         train_causal_lm_distill(teacher, student, cfg, tmp_path / "unsupported", batches)
+
+
+def test_generic_distill_remote_worker_logits_mode_uses_client_not_local_teacher(tmp_path: Path):
+    teacher = RaisingTeacher()
+    student = DummyHfMoeForCausalLM()
+    client = FakeWorkerLogitsClient(student.config.vocab_size)
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        calibration={"sample_count": 2, "sequence_length": 8},
+        training={"train_steps": 1, "global_batch_size": 1, "micro_batch_size": 1, "warmup_steps": 0},
+        kd={"teacher_mode": "remote_worker_full_logits", "mtp": {"enabled": False}},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    result = train_causal_lm_distill(
+        teacher,
+        student,
+        cfg,
+        tmp_path / "remote_worker_training",
+        batches,
+        teacher_logits_client=client,
+    )
+
+    assert result["global_step"] == 1
+    assert client.calls == [(1, 8)]
+    assert result["logs"][0]["loss_kd"] > 0
+
+
+def test_remote_worker_mode_requires_api_url_without_injected_client(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = DummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        kd={"teacher_mode": "remote_worker_full_logits"},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    with pytest.raises(ValueError, match="runtime.worker.api_url"):
+        train_causal_lm_distill(teacher, student, cfg, tmp_path / "remote_missing", batches)
 
 
 def test_generic_distill_logs_moe_aux_loss_when_model_exposes_it(tmp_path: Path):

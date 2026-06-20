@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 from slimder_man.cli import app
 from slimder_man.config.schema import SlimderConfig, save_config
+from slimder_man.distill.remote_worker import RemoteWorkerLogitsClient
 from slimder_man.orchestration.worker_api import create_worker_app
 
 
@@ -132,6 +133,66 @@ def test_worker_teacher_logits_binary_transport_and_json_fallback(tmp_path: Path
     assert fallback.status_code == 200
     assert fallback.json()["format"] == "nested_float32"
     assert fallback.json()["shape"] == [1, 1, 5]
+
+
+def test_remote_worker_logits_client_decodes_binary_transport(monkeypatch):
+    captured = {}
+    logits = np.arange(6, dtype="<f4").reshape(1, 2, 3)
+
+    class FakeResponse:
+        headers = {"X-Slimder-Logits-Format": "float32_le", "X-Slimder-Logits-Shape": "1,2,3"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return logits.tobytes()
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["headers"] = dict(req.header_items())
+        captured["body"] = req.data
+        return FakeResponse()
+
+    monkeypatch.setattr("slimder_man.distill.remote_worker.request.urlopen", fake_urlopen)
+
+    client = RemoteWorkerLogitsClient("http://worker", auth_token="secret-token", timeout_seconds=7)
+    out = client.fetch_logits(torch.tensor([[1, 2]]))
+
+    assert captured["url"] == "http://worker/v1/teacher_logits"
+    assert captured["timeout"] == 7
+    assert captured["headers"]["Authorization"] == "Bearer secret-token"
+    assert b"binary_float32" in captured["body"]
+    assert out.shape == (1, 2, 3)
+    assert out[0, 1, 2].item() == 5.0
+
+
+def test_remote_worker_logits_client_rejects_shape_mismatch(monkeypatch):
+    class FakeResponse:
+        headers = {"X-Slimder-Logits-Format": "float32_le", "X-Slimder-Logits-Shape": "1,2,99"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return np.arange(6, dtype="<f4").tobytes()
+
+    monkeypatch.setattr("slimder_man.distill.remote_worker.request.urlopen", lambda req, timeout: FakeResponse())
+
+    client = RemoteWorkerLogitsClient("http://worker")
+    try:
+        client.fetch_logits(torch.tensor([[1, 2]]))
+    except ValueError as exc:
+        assert "shape mismatch" in str(exc)
+    else:
+        raise AssertionError("client should reject malformed binary logits payloads")
 
 
 def test_worker_cli_json_reports_auth_requirement():
