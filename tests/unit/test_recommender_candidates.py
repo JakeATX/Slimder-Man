@@ -67,20 +67,38 @@ def test_all_preset_groups_return_multiple_valid_candidates():
     assert all(candidate["candidate_id"].startswith(candidate["preset"]) for candidate in candidates)
 
 
-def test_qwen_non_anchor_presets_are_architecture_relative_not_tiny_constants():
-    expected_first = {
-        "conservative_20": {"hidden_size": 1792, "remove_last_n_layers": 5, "routed_experts": 410, "routed_top_k": 10},
-        "balanced_50": {"hidden_size": 1536, "remove_last_n_layers": 10, "routed_experts": 256, "routed_top_k": 8},
-        "aggressive_80": {"hidden_size": 1280, "remove_last_n_layers": 16, "routed_experts": 128, "routed_top_k": 6},
-        "extreme_90": {"hidden_size": 1024, "remove_last_n_layers": 24, "routed_experts": 64, "routed_top_k": 4},
+def test_qwen_non_anchor_presets_solve_for_param_reduction_not_tiny_constants():
+    expected_reductions = {
+        "conservative_20": 0.20,
+        "balanced_50": 0.50,
+        "aggressive_80": 0.80,
+        "extreme_90": 0.90,
     }
 
-    for preset, expected in expected_first.items():
+    for preset, target in expected_reductions.items():
         first = recommend(qwen_architecture(), preset, max_candidates=3)[0]
-        for key, value in expected.items():
-            assert first[key] == value
+        assert first["target_total_param_reduction"] == target
+        assert first["total_reduction_error"] <= 0.01
+        assert first["estimated_total_param_reduction"] == pytest.approx(target, abs=0.01)
+        assert first["reduction_solver"] == "estimated_param_grid"
         assert first["hidden_size"] >= 1024
-        assert first["routed_experts"] >= 64
+        assert first["routed_experts"] > 0
+        assert first["routed_top_k"] <= first["routed_experts"]
+
+
+def test_config_param_reduction_override_drives_recommendation_plan():
+    cfg = SlimderConfig(
+        teacher={"load_mode": "transformers", "model_id_or_path": "Qwen/Qwen3-Next-80B-A3B-Instruct"},
+        compression={"preset": "balanced_50", "target": {"total_param_reduction": 0.65}},
+    )
+    cfg, plan = apply_recommendation_to_config(cfg, qwen_architecture(), preset="balanced_50")
+
+    candidate = plan["candidate"]
+    assert candidate["target_total_param_reduction"] == 0.65
+    assert candidate["estimated_total_param_reduction"] == pytest.approx(0.65, abs=0.01)
+    assert cfg.compression.target.total_param_reduction == 0.65
+    assert cfg.compression.plan is not None
+    assert cfg.compression.plan.target.total_param_reduction == 0.65
 
 
 def test_unknown_preset_raises():

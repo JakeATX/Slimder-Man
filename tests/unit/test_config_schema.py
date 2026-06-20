@@ -58,11 +58,14 @@ def test_nested_unknown_fields_are_rejected():
         SlimderConfig(compression={"depth": {"methdo": "last_layers"}})
 
 
-def test_unimplemented_param_reduction_targets_are_rejected():
+def test_param_reduction_targets_are_accepted_for_planning_and_bounded():
+    cfg = SlimderConfig(compression={"target": {"total_param_reduction": 0.5, "active_param_reduction": 0.4}})
+    assert cfg.compression.target.total_param_reduction == 0.5
+    assert cfg.compression.target.active_param_reduction == 0.4
     with pytest.raises(ValidationError, match="total_param_reduction"):
-        SlimderConfig(compression={"target": {"total_param_reduction": 0.5}})
+        SlimderConfig(compression={"target": {"total_param_reduction": 1.0}})
     with pytest.raises(ValidationError, match="active_param_reduction"):
-        SlimderConfig(compression={"target": {"active_param_reduction": 0.5}})
+        SlimderConfig(compression={"target": {"active_param_reduction": 0.0}})
 
 
 def test_depth_remove_fraction_schema_bounds():

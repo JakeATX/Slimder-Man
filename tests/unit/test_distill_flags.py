@@ -59,6 +59,21 @@ def test_kd_loss_applies_temperature_squared_scaling():
     assert torch.allclose(kd_loss(student, teacher, temperature), softened * temperature**2)
 
 
+def test_lm_and_kd_losses_ignore_padding_with_attention_mask():
+    input_ids = torch.tensor([[1, 2, 3, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 0]])
+    student = torch.zeros(1, 4, 5)
+    teacher = torch.zeros(1, 4, 5)
+    student[:, 2, 0] = -50.0
+    teacher[:, 2, 4] = 50.0
+
+    expected_lm = torch.nn.functional.cross_entropy(student[:, :2, :].reshape(-1, 5), input_ids[:, 1:3].reshape(-1))
+    expected_kd = kd_loss(student[:, :3, :], teacher[:, :3, :], temperature=1.0)
+
+    assert torch.allclose(lm_loss(student, input_ids, attention_mask=attention_mask), expected_lm)
+    assert torch.allclose(kd_loss(student, teacher, attention_mask=attention_mask), expected_kd)
+
+
 def test_mtp_kd_loss_applies_temperature_squared_scaling():
     ids = torch.tensor([[0, 1, 2, 1]])
     student_mtp = [torch.tensor([[[0.1, 0.2, -0.1], [0.0, 0.3, -0.2], [0.4, -0.2, 0.1], [0.2, -0.3, 0.5]]])]

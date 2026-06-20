@@ -13,6 +13,13 @@ PRESET_POLICIES = {
     "extreme_90": {"hidden_ratio": 0.50, "depth_ratio": 0.50, "expert_ratio": 0.125, "top_k_ratio": 0.40},
 }
 
+PRESET_TOTAL_REDUCTIONS = {
+    "conservative_20": 0.20,
+    "balanced_50": 0.50,
+    "aggressive_80": 0.80,
+    "extreme_90": 0.90,
+}
+
 
 @dataclass
 class Candidate:
@@ -27,15 +34,36 @@ class Candidate:
     estimated_active_params: int
     estimated_memory_bytes: int
     estimated_memory_gib: float
+    target_total_param_reduction: float | None
+    estimated_total_param_reduction: float
+    total_reduction_error: float | None
+    target_active_param_reduction: float | None
+    estimated_active_param_reduction: float
+    active_reduction_error: float | None
+    reduction_solver: str
     risk: str
     transforms: dict
 
 
-def recommend(architecture: dict, preset: str = "balanced_50", max_candidates: int = 8) -> list[dict]:
+def recommend(
+    architecture: dict,
+    preset: str = "balanced_50",
+    max_candidates: int = 8,
+    target_total_param_reduction: float | None = None,
+    target_active_param_reduction: float | None = None,
+) -> list[dict]:
     if preset == "all":
         candidates: list[dict] = []
         for name in PRESETS:
-            candidates.extend(recommend(architecture, name, max_candidates=max_candidates))
+            candidates.extend(
+                recommend(
+                    architecture,
+                    name,
+                    max_candidates=max_candidates,
+                    target_total_param_reduction=target_total_param_reduction,
+                    target_active_param_reduction=target_active_param_reduction,
+                )
+            )
         return candidates
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset {preset}")
@@ -46,6 +74,9 @@ def recommend(architecture: dict, preset: str = "balanced_50", max_candidates: i
     source_top_k = _source_top_k(architecture)
     hidden_multiple = _hidden_multiple(architecture)
     target = _target_for_preset(preset, architecture, hidden_multiple)
+    source_estimate = estimate_parameters(architecture, source_hidden, 0, source_experts, source_top_k)
+    target_total_reduction = _target_total_reduction(preset, target_total_param_reduction)
+    target_active_reduction = target_active_param_reduction
     risks = {
         "conservative_20": "low",
         "balanced_50": "medium",
@@ -54,24 +85,29 @@ def recommend(architecture: dict, preset: str = "balanced_50", max_candidates: i
         "extreme_90": "very high",
     }
     candidates = []
-    seen: set[tuple[int, int, int, int]] = set()
-    raw_candidates = []
-    for hidden in _hidden_options(source_hidden, target["hidden_size"], hidden_multiple):
-        for remove_last in _depth_options(source_layers, target["remove_last_n_layers"]):
-            for experts in _expert_options(source_experts, target["routed_experts"]):
-                for top_k in _top_k_options(source_top_k, target["routed_top_k"]):
-                    key = (hidden, remove_last, experts, top_k)
-                    if key in seen:
-                        continue
-                    try:
-                        validate_target(architecture, hidden, remove_last, experts, top_k, hidden_multiple)
-                    except ValueError:
-                        continue
-                    seen.add(key)
-                    raw_candidates.append(key)
-    raw_candidates.sort(key=lambda item: _candidate_sort_key(item, target))
-    for idx, (hidden, remove_last, experts, top_k) in enumerate(_select_diverse_candidates(raw_candidates, target, max_candidates), start=1):
+    if preset == "slimqwen_anchor" or source_hidden < 128:
+        raw_candidates = _dimension_neighborhood(architecture, target, hidden_multiple)
+        raw_candidates.sort(key=lambda item: _candidate_sort_key(item, target))
+        selected = _select_diverse_candidates(raw_candidates, target, max_candidates)
+        solver_name = "anchor_neighborhood" if preset == "slimqwen_anchor" else "tiny_dimension_neighborhood"
+    else:
+        raw_candidates = _reduction_grid(architecture, hidden_multiple, target_active_reduction=target_active_reduction)
+        raw_candidates.sort(
+            key=lambda item: _reduction_sort_key(
+                architecture,
+                item,
+                source_estimate.total_params,
+                source_estimate.active_params,
+                target_total_reduction,
+                target_active_reduction,
+            )
+        )
+        selected = _select_diverse_reduction_candidates(raw_candidates, max_candidates)
+        solver_name = "estimated_param_grid"
+    for idx, (hidden, remove_last, experts, top_k) in enumerate(selected, start=1):
         estimate = estimate_parameters(architecture, hidden, remove_last, experts, top_k)
+        total_reduction = _reduction(source_estimate.total_params, estimate.total_params)
+        active_reduction = _reduction(source_estimate.active_params, estimate.active_params)
         candidates.append(
             Candidate(
                 preset=preset,
@@ -85,6 +121,13 @@ def recommend(architecture: dict, preset: str = "balanced_50", max_candidates: i
                 estimated_active_params=estimate.active_params,
                 estimated_memory_bytes=estimate.memory_bytes,
                 estimated_memory_gib=estimate.memory_gib,
+                target_total_param_reduction=target_total_reduction,
+                estimated_total_param_reduction=total_reduction,
+                total_reduction_error=_error(target_total_reduction, total_reduction),
+                target_active_param_reduction=target_active_reduction,
+                estimated_active_param_reduction=active_reduction,
+                active_reduction_error=_error(target_active_reduction, active_reduction),
+                reduction_solver=solver_name,
                 risk=risks[preset],
                 transforms=_transforms(architecture, hidden, remove_last, experts, top_k, hidden_multiple),
             )
@@ -150,8 +193,68 @@ def _target_for_preset(preset: str, architecture: dict, hidden_multiple: int) ->
     return target
 
 
+def _target_total_reduction(preset: str, override: float | None) -> float | None:
+    if override is not None:
+        return override
+    return PRESET_TOTAL_REDUCTIONS.get(preset)
+
+
+def _dimension_neighborhood(architecture: dict, target: dict, hidden_multiple: int) -> list[tuple[int, int, int, int]]:
+    source_hidden = int(architecture["hidden_size"])
+    source_layers = int(architecture["num_layers"])
+    source_experts = _source_routed_experts(architecture)
+    source_top_k = _source_top_k(architecture)
+    seen: set[tuple[int, int, int, int]] = set()
+    raw_candidates = []
+    for hidden in _hidden_options(source_hidden, target["hidden_size"], hidden_multiple):
+        for remove_last in _depth_options(source_layers, target["remove_last_n_layers"]):
+            for experts in _expert_options(source_experts, target["routed_experts"]):
+                for top_k in _top_k_options(source_top_k, target["routed_top_k"]):
+                    key = (hidden, remove_last, experts, top_k)
+                    if key in seen:
+                        continue
+                    try:
+                        validate_target(architecture, hidden, remove_last, experts, top_k, hidden_multiple)
+                    except ValueError:
+                        continue
+                    seen.add(key)
+                    raw_candidates.append(key)
+    return raw_candidates
+
+
+def _reduction_grid(architecture: dict, hidden_multiple: int, target_active_reduction: float | None = None) -> list[tuple[int, int, int, int]]:
+    source_hidden = int(architecture["hidden_size"])
+    source_layers = int(architecture["num_layers"])
+    source_experts = _source_routed_experts(architecture)
+    source_top_k = _source_top_k(architecture)
+    raw_candidates = []
+    for hidden in _solver_hidden_options(source_hidden, hidden_multiple):
+        for remove_last in range(0, source_layers):
+            for experts in _solver_expert_options(source_experts):
+                top_k_values = range(1, min(source_top_k, experts) + 1) if target_active_reduction is not None else [min(source_top_k, experts)]
+                for top_k in top_k_values:
+                    try:
+                        validate_target(architecture, hidden, remove_last, experts, top_k, hidden_multiple)
+                    except ValueError:
+                        continue
+                    raw_candidates.append((hidden, remove_last, experts, top_k))
+    return raw_candidates
+
+
 def _floor_to_multiple(value: int, multiple: int) -> int:
     return max(multiple, (value // multiple) * multiple)
+
+
+def _solver_hidden_options(source_hidden: int, multiple: int) -> list[int]:
+    return list(range(source_hidden, multiple - 1, -multiple))
+
+
+def _solver_expert_options(source_experts: int) -> list[int]:
+    step = max(1, source_experts // 64)
+    values = list(range(source_experts, 0, -step))
+    if values[-1] != 1:
+        values.append(1)
+    return values
 
 
 def _hidden_options(source_hidden: int, target_hidden: int, multiple: int) -> list[int]:
@@ -198,6 +301,30 @@ def _candidate_sort_key(item: tuple[int, int, int, int], target: dict) -> tuple[
     return (distance, -hidden, remove_last, -experts, -top_k)
 
 
+def _reduction_sort_key(
+    architecture: dict,
+    item: tuple[int, int, int, int],
+    source_total_params: int,
+    source_active_params: int,
+    target_total_reduction: float | None,
+    target_active_reduction: float | None,
+) -> tuple[float, float, int, int, int, int]:
+    hidden, remove_last, experts, top_k = item
+    estimate = estimate_parameters(architecture, hidden, remove_last, experts, top_k)
+    total_reduction = _reduction(source_total_params, estimate.total_params)
+    active_reduction = _reduction(source_active_params, estimate.active_params)
+    total_error = _error(target_total_reduction, total_reduction)
+    active_error = _error(target_active_reduction, active_reduction)
+    return (
+        total_error if total_error is not None else 0.0,
+        active_error if active_error is not None else 0.0,
+        -hidden,
+        remove_last,
+        -experts,
+        -top_k,
+    )
+
+
 def _select_diverse_candidates(candidates: list[tuple[int, int, int, int]], target: dict, limit: int) -> list[tuple[int, int, int, int]]:
     target_tuple = (
         target["hidden_size"],
@@ -218,6 +345,28 @@ def _select_diverse_candidates(candidates: list[tuple[int, int, int, int]], targ
         if item not in selected:
             selected.append(item)
     return selected[:limit]
+
+
+def _select_diverse_reduction_candidates(candidates: list[tuple[int, int, int, int]], limit: int) -> list[tuple[int, int, int, int]]:
+    selected: list[tuple[int, int, int, int]] = []
+    for item in candidates:
+        if len(selected) >= limit:
+            break
+        if item not in selected:
+            selected.append(item)
+    return selected
+
+
+def _reduction(source: int, target: int) -> float:
+    if source <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, 1.0 - (target / source))), 6)
+
+
+def _error(target: float | None, actual: float) -> float | None:
+    if target is None:
+        return None
+    return round(abs(actual - target), 6)
 
 
 def _transforms(architecture: dict, hidden: int, remove_last: int, experts: int, top_k: int, hidden_multiple: int) -> dict:

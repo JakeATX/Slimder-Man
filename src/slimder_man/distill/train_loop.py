@@ -94,13 +94,22 @@ def _teacher_logits_client(cfg: SlimderConfig, teacher_logits_client: TeacherLog
     return None
 
 
-def _teacher_output(teacher, input_ids: torch.Tensor, client: TeacherLogitsClient | None):
+def _model_output(model, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None):
+    if attention_mask is not None:
+        try:
+            return model(input_ids=input_ids, attention_mask=attention_mask)
+        except TypeError:
+            pass
+    try:
+        return model(input_ids=input_ids)
+    except TypeError:
+        return model(input_ids)
+
+
+def _teacher_output(teacher, input_ids: torch.Tensor, client: TeacherLogitsClient | None, attention_mask: torch.Tensor | None = None):
     if client is not None:
         return client.teacher_output(input_ids)
-    try:
-        return teacher(input_ids=input_ids)
-    except TypeError:
-        return teacher(input_ids)
+    return _model_output(teacher, input_ids, attention_mask=attention_mask)
 
 
 def _mean_parts(rows: list[dict[str, float]]) -> dict[str, float]:
@@ -308,6 +317,7 @@ def train_causal_lm_distill(
     schedule_total_steps = global_total_steps or total_steps
     teacher.eval()
     student.train()
+    tokens_seen = 0
     for step in range(start_step, total_steps):
         schedule_step = global_step_offset + step
         lr = global_cosine_lr(
@@ -330,9 +340,11 @@ def train_causal_lm_distill(
                 step * accum_steps * micro_batch_size + micro_step * micro_batch_size,
                 micro_batch_size,
             )
+            attention_mask = micro_batch.ne(0).to(dtype=torch.long)
+            tokens_seen += int(attention_mask.sum().item())
             with torch.no_grad():
-                teacher_out = _teacher_output(teacher, micro_batch, remote_client)
-            student_out = student(input_ids=micro_batch)
+                teacher_out = _teacher_output(teacher, micro_batch, remote_client, attention_mask=attention_mask)
+            student_out = _model_output(student, micro_batch, attention_mask=attention_mask)
             loss, parts = total_distill_loss(
                 student_out,
                 teacher_out,
@@ -343,6 +355,7 @@ def train_causal_lm_distill(
                 kd_enabled=cfg.kd.enabled,
                 mtp_enabled=cfg.kd.mtp.enabled and bool(getattr(student_out, "mtp_logits", [])),
                 moe_aux_weight=moe_aux_weight,
+                attention_mask=attention_mask,
             )
             if not torch.isfinite(loss):
                 raise ValueError("NaN or Inf distillation loss")
@@ -361,6 +374,7 @@ def train_causal_lm_distill(
             "lr": lr,
             "gradient_accumulation_steps": accum_steps,
             "micro_batch_size": micro_batch_size,
+            "tokens_seen": tokens_seen,
             **parts,
         }
         logs.append(row)
@@ -384,6 +398,7 @@ def train_causal_lm_distill(
                     "global_total_steps": schedule_total_steps,
                     "gradient_accumulation_steps": accum_steps,
                     "micro_batch_size": micro_batch_size,
+                    "tokens_seen": tokens_seen,
                     "logs": logs,
                     "config": cfg.model_dump(mode="json"),
                     "optimizer_state": str(opt_path),

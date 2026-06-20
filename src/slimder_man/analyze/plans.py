@@ -31,7 +31,12 @@ def apply_recommendation_to_config(
     candidate_id: str | None = None,
 ) -> tuple[SlimderConfig, dict[str, Any]]:
     preset_name = preset or cfg.compression.preset
-    candidates = recommend(architecture, preset_name)
+    candidates = recommend(
+        architecture,
+        preset_name,
+        target_total_param_reduction=cfg.compression.target.total_param_reduction,
+        target_active_param_reduction=cfg.compression.target.active_param_reduction,
+    )
     candidate = _select_candidate(candidates, candidate_id)
     cfg.compression.preset = preset_name
     cfg.compression.target.hidden_size = int(candidate["hidden_size"])

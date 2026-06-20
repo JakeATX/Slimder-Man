@@ -271,10 +271,10 @@ class SlimderConfig(StrictBaseModel):
     def validate_implemented_target_fields(self) -> "SlimderConfig":
         target = self.compression.target
         errors: list[str] = []
-        if target.total_param_reduction is not None:
-            errors.append("compression.target.total_param_reduction is planner-only and is not accepted by direct compression yet; use a preset or explicit target dimensions")
-        if target.active_param_reduction is not None:
-            errors.append("compression.target.active_param_reduction is planner-only and is not accepted by direct compression yet; use a preset or explicit target dimensions")
+        if target.total_param_reduction is not None and not 0 < target.total_param_reduction < 1:
+            errors.append("compression.target.total_param_reduction must be > 0 and < 1")
+        if target.active_param_reduction is not None and not 0 < target.active_param_reduction < 1:
+            errors.append("compression.target.active_param_reduction must be > 0 and < 1")
         if target.depth_remove_fraction is not None and not 0 <= target.depth_remove_fraction < 1:
             errors.append("compression.target.depth_remove_fraction must be >= 0 and < 1")
         if errors:

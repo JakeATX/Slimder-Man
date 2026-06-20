@@ -26,7 +26,7 @@ from slimder_man.compression.validate import validate_tiny_model
 from slimder_man.config.defaults import tiny_default_config
 from slimder_man.config.schema import SlimderConfig, load_config, save_config
 from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_distill
-from slimder_man.distill.stage_runner import run_tiny_progressive_stages
+from slimder_man.distill.stage_runner import run_generic_progressive_stages, run_tiny_progressive_stages
 from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.local import local_dry_run_commands
 from slimder_man.orchestration.skypilot import SkyPilotRunner, skypilot_yaml
@@ -553,6 +553,30 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
         write_json(analysis_dir / "architecture.json", arch)
         calibration_manifest = write_calibration_artifacts(analysis_dir, cfg, cal, cal_manifest, arch)
         write_analysis_report(analysis_dir / "analysis_report.md", arch, recs)
+        if cfg.progressive.stages > 1 or cfg.progressive.schedule != "one_stage":
+            progressive = run_generic_progressive_stages(
+                teacher,
+                cfg,
+                out_dir / "progressive",
+                tokenizer=tokenizer,
+                load_teacher_fn=lambda: _load_model(cfg),
+                load_checkpoint_fn=lambda path: _load_transformers_checkpoint(cfg, path),
+                source_config_path=config,
+            )
+            final_train = Path(progressive["final_training_checkpoint"])
+            student = _load_transformers_checkpoint(cfg, final_train)
+            eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=describe_model(student)["vocab_size"], tokenizer=tokenizer)
+            ppl = causal_lm_perplexity(student, eval_batches[:8])
+            result = {
+                "analysis": str(analysis_dir),
+                "calibration_manifest": calibration_manifest,
+                "progressive": progressive,
+                "perplexity": ppl,
+                "recommendations": recs,
+            }
+            write_json(out_dir / "run_summary.json", result)
+            _echo(result, json_output)
+            return
         ckpt_dir = out_dir / "checkpoints" / "stage_1_compressed"
         student, manifest = compress_model(
             teacher,
