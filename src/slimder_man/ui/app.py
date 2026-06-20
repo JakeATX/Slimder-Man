@@ -296,10 +296,11 @@ def create_app(test_mode: bool = False):
                 artifacts_btn = gr.Button("Refresh Artifacts")
                 artifacts_out = gr.Textbox(lines=12, label="Artifacts")
                 warnings_out = gr.Textbox(value="No warnings.", lines=4, label="Warnings")
-            output = gr.Code(value=build_config_yaml(), label="Generated YAML", language="yaml")
-            btn = gr.Button("Generate Config")
-            run_btn = gr.Button("Run Tiny Pipeline")
-            run_out = gr.Code(language="json", label="Run Output")
+            with gr.Tab("Config"):
+                output = gr.Code(value=build_config_yaml(), label="Generated YAML", language="yaml")
+                btn = gr.Button("Generate Config")
+                run_btn = gr.Button("Run Tiny Pipeline")
+                run_out = gr.Code(language="json", label="Run Output")
         def _build_from_ui(project_name, paper_faithful, quantization, teacher_model_id_or_path, teacher_load_mode, teacher_dtype, teacher_revision, trust_remote_code, dataset_type, dataset_name, dataset_path, dataset_split, text_field, sample_count, sequence_length, token_budget, train_steps, runtime_backend, local_num_gpus, local_allow_full_model_run, ssh_host, ssh_user, ssh_port, ssh_dry_run, skypilot_cluster_name, skypilot_accelerators, skypilot_cloud, skypilot_region, skypilot_image_id, skypilot_disk_size_gb, skypilot_autostop_minutes, skypilot_dry_run, worker_api_url, worker_auth_token_env, worker_timeout_seconds, kd_teacher_mode, offline_full_logits_cache_path, tracking_backend, output_dir_value, compression_preset):
             return build_config_yaml(
                 project_name=project_name,

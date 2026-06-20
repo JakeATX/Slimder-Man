@@ -3,10 +3,11 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.distill.offline_cache import write_full_logits_cache
+from slimder_man.distill.offline_cache import OfflineFullLogitsCache, write_full_logits_cache
 from slimder_man.distill.train_loop import train_causal_lm_distill
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -237,6 +238,25 @@ def test_generic_distill_offline_full_logits_cache_uses_exact_entries(tmp_path: 
 
     assert result["global_step"] == 1
     assert result["logs"][0]["loss_kd"] > 0
+
+
+def test_offline_full_logits_cache_uses_restricted_torch_loader(monkeypatch, tmp_path: Path):
+    cache_path = tmp_path / "full_logits_cache.pt"
+    input_ids = torch.tensor([[1, 2, 3]])
+    logits = torch.zeros(1, 3, 5)
+    write_full_logits_cache(cache_path, [(input_ids, logits)])
+    real_load = torch.load
+    captured = {}
+
+    def recording_load(*args, **kwargs):
+        captured["weights_only"] = kwargs.get("weights_only")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr("slimder_man.distill.offline_cache.torch.load", recording_load)
+
+    OfflineFullLogitsCache.from_path(cache_path)
+
+    assert captured["weights_only"] is True
 
 
 def test_offline_full_logits_cache_requires_path(tmp_path: Path):

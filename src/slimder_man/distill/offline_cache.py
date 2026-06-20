@@ -23,7 +23,7 @@ class OfflineFullLogitsCache:
         cache_path = Path(path)
         if not cache_path.exists():
             raise ValueError(f"offline full-logit cache not found: {cache_path}")
-        data = torch.load(cache_path, map_location="cpu", weights_only=False)
+        data = torch.load(cache_path, map_location="cpu", weights_only=True)
         return cls(_entries_from_cache_payload(data))
 
     def teacher_output(self, input_ids: torch.Tensor) -> SimpleNamespace:
