@@ -26,6 +26,7 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
             train_steps=7,
             runtime_backend="ssh",
             local_num_gpus="2",
+            local_allow_full_model_run=True,
             ssh_host="gpu.example",
             ssh_user="trainer",
             ssh_port=2222,
@@ -33,6 +34,16 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
             skypilot_cluster_name="slimder-prod",
             skypilot_accelerators="A100:4",
             skypilot_cloud="aws",
+            skypilot_region="us-east-1",
+            skypilot_image_id="docker:python:3.12",
+            skypilot_disk_size_gb=768,
+            skypilot_autostop_minutes=45,
+            skypilot_dry_run=False,
+            worker_api_url="http://worker.example:7861",
+            worker_auth_token_env="SLIMDER_TEST_TOKEN",
+            worker_timeout_seconds=12.5,
+            kd_teacher_mode="offline_full_logits_cache",
+            offline_full_logits_cache_path="cache/full_logits.pt",
             tracking_backend="none",
             compression_preset="aggressive_80",
         )
@@ -54,8 +65,11 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
     assert cfg.training.token_budget == 2048
     assert cfg.training.train_steps == 7
     assert cfg.compression.preset == "aggressive_80"
+    assert cfg.kd.teacher_mode == "offline_full_logits_cache"
+    assert cfg.kd.offline_full_logits_cache_path == "cache/full_logits.pt"
     assert cfg.runtime.backend == "ssh"
     assert cfg.runtime.local.num_gpus == 2
+    assert cfg.runtime.local.allow_full_model_run is True
     assert cfg.runtime.ssh.host == "gpu.example"
     assert cfg.runtime.ssh.user == "trainer"
     assert cfg.runtime.ssh.port == 2222
@@ -63,6 +77,14 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
     assert cfg.runtime.skypilot.cluster_name == "slimder-prod"
     assert cfg.runtime.skypilot.accelerators == "A100:4"
     assert cfg.runtime.skypilot.cloud == "aws"
+    assert cfg.runtime.skypilot.region == "us-east-1"
+    assert cfg.runtime.skypilot.image_id == "docker:python:3.12"
+    assert cfg.runtime.skypilot.disk_size_gb == 768
+    assert cfg.runtime.skypilot.autostop_minutes == 45
+    assert cfg.runtime.skypilot.dry_run is False
+    assert cfg.runtime.worker.api_url == "http://worker.example:7861"
+    assert cfg.runtime.worker.auth_token_env == "SLIMDER_TEST_TOKEN"
+    assert cfg.runtime.worker.timeout_seconds == 12.5
     assert cfg.runtime.tracking.backend == "none"
 
 

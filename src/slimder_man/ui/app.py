@@ -39,6 +39,17 @@ def build_config_yaml(
     tracking_backend: str = "tensorboard",
     output_dir: str | None = None,
     compression_preset: str | None = None,
+    local_allow_full_model_run: bool = False,
+    skypilot_region: str = "",
+    skypilot_image_id: str = "",
+    skypilot_disk_size_gb: int = 512,
+    skypilot_autostop_minutes: int = 60,
+    skypilot_dry_run: bool = True,
+    worker_api_url: str = "",
+    worker_auth_token_env: str = "SLIMDER_WORKER_TOKEN",
+    worker_timeout_seconds: float = 60.0,
+    kd_teacher_mode: str = "online_full_logits",
+    offline_full_logits_cache_path: str = "",
 ) -> str:
     import yaml
 
@@ -66,6 +77,7 @@ def build_config_yaml(
         cfg.compression.preset = compression_preset
     cfg.runtime.backend = runtime_backend
     cfg.runtime.local.num_gpus = "auto" if local_num_gpus == "auto" else int(local_num_gpus)
+    cfg.runtime.local.allow_full_model_run = bool(local_allow_full_model_run)
     cfg.runtime.ssh.host = ssh_host or None
     cfg.runtime.ssh.user = ssh_user or None
     cfg.runtime.ssh.port = int(ssh_port)
@@ -73,6 +85,16 @@ def build_config_yaml(
     cfg.runtime.skypilot.cluster_name = skypilot_cluster_name
     cfg.runtime.skypilot.accelerators = skypilot_accelerators
     cfg.runtime.skypilot.cloud = skypilot_cloud
+    cfg.runtime.skypilot.region = skypilot_region or None
+    cfg.runtime.skypilot.image_id = skypilot_image_id or None
+    cfg.runtime.skypilot.disk_size_gb = int(skypilot_disk_size_gb)
+    cfg.runtime.skypilot.autostop_minutes = int(skypilot_autostop_minutes)
+    cfg.runtime.skypilot.dry_run = bool(skypilot_dry_run)
+    cfg.runtime.worker.api_url = worker_api_url or None
+    cfg.runtime.worker.auth_token_env = worker_auth_token_env or None
+    cfg.runtime.worker.timeout_seconds = float(worker_timeout_seconds)
+    cfg.kd.teacher_mode = kd_teacher_mode
+    cfg.kd.offline_full_logits_cache_path = offline_full_logits_cache_path or None
     cfg.runtime.tracking.backend = tracking_backend
     return yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False)
 
@@ -220,8 +242,11 @@ def create_app(test_mode: bool = False):
                 sequence_length = gr.Number(value=16, precision=0, label="Sequence length")
                 token_budget = gr.Number(value=1024, precision=0, label="Token budget")
                 train_steps = gr.Number(value=5, precision=0, label="Train steps")
+                kd_teacher_mode = gr.Dropdown(["online_full_logits", "offline_full_logits_cache", "remote_worker_full_logits"], value="online_full_logits", label="KD teacher mode")
+                offline_cache = gr.Textbox(value="", label="Offline full-logit cache")
                 runtime_backend = gr.Dropdown(["local", "ssh", "skypilot", "worker"], value="local", label="Runtime backend")
                 local_gpus = gr.Textbox(value="auto", label="Local GPUs")
+                local_allow_full_model = gr.Checkbox(value=False, label="Allow local full-model run")
                 ssh_host = gr.Textbox(value="", label="SSH host")
                 ssh_user = gr.Textbox(value="", label="SSH user")
                 ssh_port = gr.Number(value=22, precision=0, label="SSH port")
@@ -229,6 +254,14 @@ def create_app(test_mode: bool = False):
                 sky_cluster = gr.Textbox(value="slimder", label="SkyPilot cluster")
                 sky_accelerators = gr.Textbox(value="H100:8", label="SkyPilot accelerators")
                 sky_cloud = gr.Textbox(value="auto", label="SkyPilot cloud")
+                sky_region = gr.Textbox(value="", label="SkyPilot region")
+                sky_image = gr.Textbox(value="", label="SkyPilot image")
+                sky_disk = gr.Number(value=512, precision=0, label="SkyPilot disk GB")
+                sky_autostop = gr.Number(value=60, precision=0, label="SkyPilot autostop minutes")
+                sky_dry = gr.Checkbox(value=True, label="SkyPilot dry run")
+                worker_url = gr.Textbox(value="", label="Worker API URL")
+                worker_token_env = gr.Textbox(value="SLIMDER_WORKER_TOKEN", label="Worker token env")
+                worker_timeout = gr.Number(value=60.0, label="Worker timeout seconds")
                 tracking = gr.Dropdown(["tensorboard", "wandb", "mlflow", "none"], value="tensorboard", label="Tracking")
             with gr.Tab("Analyze"):
                 analyze_btn = gr.Button("Run Analyze")
@@ -267,68 +300,48 @@ def create_app(test_mode: bool = False):
             btn = gr.Button("Generate Config")
             run_btn = gr.Button("Run Tiny Pipeline")
             run_out = gr.Code(language="json", label="Run Output")
-        config_inputs = [
-            project,
-            faithful,
-            quant,
-            teacher_model,
-            teacher_load,
-            teacher_dtype,
-            teacher_revision,
-            trust_remote,
-            dataset_type,
-            dataset_name,
-            dataset_path,
-            dataset_split,
-            text_field,
-            sample_count,
-            sequence_length,
-            token_budget,
-            train_steps,
-            runtime_backend,
-            local_gpus,
-            ssh_host,
-            ssh_user,
-            ssh_port,
-            ssh_dry,
-            sky_cluster,
-            sky_accelerators,
-            sky_cloud,
-            tracking,
-            output_dir,
-        ]
-        # build_config_yaml keeps output_dir as the last optional argument.
-        def _build_from_ui(project_name, paper_faithful, quantization, teacher_model_id_or_path, teacher_load_mode, teacher_dtype, teacher_revision, trust_remote_code, dataset_type, dataset_name, dataset_path, dataset_split, text_field, sample_count, sequence_length, token_budget, train_steps, runtime_backend, local_num_gpus, ssh_host, ssh_user, ssh_port, ssh_dry_run, skypilot_cluster_name, skypilot_accelerators, skypilot_cloud, tracking_backend, output_dir_value, compression_preset):
+        def _build_from_ui(project_name, paper_faithful, quantization, teacher_model_id_or_path, teacher_load_mode, teacher_dtype, teacher_revision, trust_remote_code, dataset_type, dataset_name, dataset_path, dataset_split, text_field, sample_count, sequence_length, token_budget, train_steps, runtime_backend, local_num_gpus, local_allow_full_model_run, ssh_host, ssh_user, ssh_port, ssh_dry_run, skypilot_cluster_name, skypilot_accelerators, skypilot_cloud, skypilot_region, skypilot_image_id, skypilot_disk_size_gb, skypilot_autostop_minutes, skypilot_dry_run, worker_api_url, worker_auth_token_env, worker_timeout_seconds, kd_teacher_mode, offline_full_logits_cache_path, tracking_backend, output_dir_value, compression_preset):
             return build_config_yaml(
-                project_name,
-                paper_faithful,
-                quantization,
-                teacher_model_id_or_path,
-                teacher_load_mode,
-                teacher_dtype,
-                teacher_revision,
-                trust_remote_code,
-                dataset_type,
-                dataset_name,
-                dataset_path,
-                dataset_split,
-                text_field,
-                sample_count,
-                sequence_length,
-                token_budget,
-                train_steps,
-                runtime_backend,
-                local_num_gpus,
-                ssh_host,
-                ssh_user,
-                ssh_port,
-                ssh_dry_run,
-                skypilot_cluster_name,
-                skypilot_accelerators,
-                skypilot_cloud,
-                tracking_backend,
-                output_dir_value,
+                project_name=project_name,
+                paper_faithful=paper_faithful,
+                quantization=quantization,
+                teacher_model_id_or_path=teacher_model_id_or_path,
+                teacher_load_mode=teacher_load_mode,
+                teacher_dtype=teacher_dtype,
+                teacher_revision=teacher_revision,
+                trust_remote_code=trust_remote_code,
+                dataset_type=dataset_type,
+                dataset_name=dataset_name,
+                dataset_path=dataset_path,
+                dataset_split=dataset_split,
+                text_field=text_field,
+                sample_count=sample_count,
+                sequence_length=sequence_length,
+                token_budget=token_budget,
+                train_steps=train_steps,
+                runtime_backend=runtime_backend,
+                local_num_gpus=local_num_gpus,
+                ssh_host=ssh_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_dry_run=ssh_dry_run,
+                skypilot_cluster_name=skypilot_cluster_name,
+                skypilot_accelerators=skypilot_accelerators,
+                skypilot_cloud=skypilot_cloud,
+                tracking_backend=tracking_backend,
+                output_dir=output_dir_value,
                 compression_preset=compression_preset,
+                local_allow_full_model_run=local_allow_full_model_run,
+                skypilot_region=skypilot_region,
+                skypilot_image_id=skypilot_image_id,
+                skypilot_disk_size_gb=skypilot_disk_size_gb,
+                skypilot_autostop_minutes=skypilot_autostop_minutes,
+                skypilot_dry_run=skypilot_dry_run,
+                worker_api_url=worker_api_url,
+                worker_auth_token_env=worker_auth_token_env,
+                worker_timeout_seconds=worker_timeout_seconds,
+                kd_teacher_mode=kd_teacher_mode,
+                offline_full_logits_cache_path=offline_full_logits_cache_path,
             )
 
         def _run_from_ui(command, *args, preset_value="balanced_50", stage_value=1, backend_value="local", checkpoint_value=None):
@@ -361,6 +374,7 @@ def create_app(test_mode: bool = False):
             train_steps,
             runtime_backend,
             local_gpus,
+            local_allow_full_model,
             ssh_host,
             ssh_user,
             ssh_port,
@@ -368,6 +382,16 @@ def create_app(test_mode: bool = False):
             sky_cluster,
             sky_accelerators,
             sky_cloud,
+            sky_region,
+            sky_image,
+            sky_disk,
+            sky_autostop,
+            sky_dry,
+            worker_url,
+            worker_token_env,
+            worker_timeout,
+            kd_teacher_mode,
+            offline_cache,
             tracking,
             output_dir,
         ]
