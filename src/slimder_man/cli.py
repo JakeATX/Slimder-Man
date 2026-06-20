@@ -13,6 +13,7 @@ from rich import print
 from slimder_man.adapters.registry import get_adapter
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.analyze.architecture import describe_model
+from slimder_man.analyze.config_only import describe_config_architecture
 from slimder_man.analyze.recommender import recommend
 from slimder_man.analyze.reports import write_analysis_report
 from slimder_man.calibration.artifacts import write_calibration_artifacts
@@ -125,6 +126,20 @@ def _load_transformers_tokenizer(cfg: SlimderConfig):
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
+        cfg.teacher.model_id_or_path,
+        revision=cfg.teacher.revision,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+    )
+
+
+def _load_transformers_config(cfg: SlimderConfig):
+    if cfg.teacher.model_id_or_path == "dummy-hf-moe":
+        from slimder_man.adapters.hf_dummy import DummyHfMoeConfig
+
+        return DummyHfMoeConfig()
+    from transformers import AutoConfig
+
+    return AutoConfig.from_pretrained(
         cfg.teacher.model_id_or_path,
         revision=cfg.teacher.revision,
         trust_remote_code=cfg.teacher.trust_remote_code,
@@ -353,9 +368,20 @@ def init_config(out: Path = Path("config.yaml"), json_output: bool = typer.Optio
 
 
 @app.command()
-def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+def analyze(config: Path, config_only: bool = typer.Option(False, "--config-only"), json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
+    out_dir = Path(cfg.project.output_dir) / "analysis"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if config_only:
+        if cfg.teacher.load_mode != "transformers":
+            raise typer.BadParameter("--config-only is only valid for teacher.load_mode=transformers")
+        arch = describe_config_architecture(_load_transformers_config(cfg))
+        recs = recommend(arch, cfg.compression.preset)
+        write_json(out_dir / "architecture.json", arch)
+        write_analysis_report(out_dir / "analysis_report.md", arch, recs)
+        _echo({"architecture": arch, "analysis_dir": str(out_dir), "recommendations": recs, "config_only": True}, json_output)
+        return
     model = _load_model(cfg)
     arch = describe_model(model)
     tokenizer = _load_tokenizer(cfg)
@@ -364,8 +390,6 @@ def analyze(config: Path, json_output: bool = typer.Option(False, "--json")) -> 
         cal = collect_tiny_calibration(model, batches)
     else:
         cal = collect_calibration(model, batches, get_adapter(model))
-    out_dir = Path(cfg.project.output_dir) / "analysis"
-    out_dir.mkdir(parents=True, exist_ok=True)
     recs = recommend(arch, cfg.compression.preset)
     write_json(out_dir / "architecture.json", arch)
     artifact_manifest = write_calibration_artifacts(out_dir, cfg, cal, cal_manifest, arch)

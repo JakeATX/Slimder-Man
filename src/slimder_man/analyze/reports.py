@@ -4,7 +4,22 @@ from pathlib import Path
 
 
 def write_analysis_report(path: str | Path, architecture: dict, recommendations: list[dict], warnings: list[str] | None = None) -> None:
-    lines = ["# Slimder Man Analysis Report", "", "## Architecture", ""]
+    lines = ["# Slimder Man Analysis Report", ""]
+    if architecture.get("source") == "config_only":
+        lines.extend(
+            [
+                "## Scope",
+                "",
+                "- source: config_only",
+                "- calibration: not_run",
+                "- weights_loaded: false",
+                "- parameter_counts: not_checkpoint_derived",
+                "- recommendation_estimates: formula_based_from_config",
+                "- mtp_detection: config_fields_only",
+                "",
+            ]
+        )
+    lines.extend(["## Architecture", ""])
     for key in ("model_type", "total_params", "hidden_size", "vocab_size", "num_layers", "has_mtp", "mtp_depths", "tied_embeddings"):
         lines.append(f"- {key}: {architecture.get(key)}")
     lines.extend(["", "## Recommendations", ""])
