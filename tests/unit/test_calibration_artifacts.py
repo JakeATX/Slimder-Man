@@ -88,6 +88,48 @@ def test_calibration_artifact_writer_persists_tensors_and_provenance(tmp_path: P
         assert artifact["sha256"] == sha256_file(out_dir / artifact["path"])
 
 
+def test_generic_calibration_hooks_uninstrumented_moe_layers():
+    model = DummyHfMoeForCausalLM()
+    for layer in model.model.layers:
+        moe = layer.mlp
+        original_forward = moe.forward
+
+        def clearing_forward(x, *, _original_forward=original_forward, _moe=moe):
+            out = _original_forward(x)
+            _moe.last_router_logits = None
+            _moe.last_topk_indices = None
+            _moe.last_topk_weights = None
+            _moe.last_expert_output_norm2 = None
+            return out
+
+        moe.forward = clearing_forward
+    batches, _ = sample_calibration_tokens(SlimderConfig(calibration={"sample_count": 2, "sequence_length": 8}).calibration, vocab_size=model.config.vocab_size)
+
+    calibration = collect_calibration(model, batches)
+
+    assert calibration.representation == "router_hook_recomputed_expert_outputs"
+    assert len(calibration.expert_frequency) == model.config.num_hidden_layers
+    assert calibration.expert_frequency[0].shape == (model.config.num_experts,)
+    assert calibration.expert_soft[0].shape == (model.config.num_experts,)
+    assert calibration.expert_reap[0].shape == (model.config.num_experts,)
+    assert torch.isfinite(calibration.hidden_scores).all()
+    assert torch.isfinite(calibration.expert_frequency[0]).all()
+    assert torch.isfinite(calibration.expert_soft[0]).all()
+    assert torch.isfinite(calibration.expert_reap[0]).all()
+    assert calibration.expert_soft[0].sum() > 0
+    assert calibration.expert_similarity[0].shape == (model.config.num_experts, model.config.num_experts)
+
+
+def test_generic_calibration_restores_training_mode():
+    model = DummyHfMoeForCausalLM()
+    model.train()
+    batches, _ = sample_calibration_tokens(SlimderConfig(calibration={"sample_count": 1, "sequence_length": 8}).calibration, vocab_size=model.config.vocab_size)
+
+    collect_calibration(model, batches)
+
+    assert model.training is True
+
+
 def test_non_tiny_analyze_writes_calibration_artifacts(monkeypatch, tmp_path: Path):
     from slimder_man import cli
 

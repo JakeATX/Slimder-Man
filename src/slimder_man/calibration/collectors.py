@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import torch
 
@@ -100,19 +101,19 @@ def hidden_keep_indices(scores: torch.Tensor, target_hidden_size: int) -> torch.
 
 
 def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> CalibrationResult:
-    """Generic calibration collector for MoE fixtures exposing routing traces.
+    """Generic calibration collector for adapter-discovered MoE models.
 
-    The collector is intentionally structural and model-agnostic: adapters find
-    RMSNorms and MoE modules; MoE modules are expected to expose routing traces
-    (`last_router_logits`, `last_topk_indices`, `last_topk_weights`,
-    `last_expert_output_norm2`) after forward. This matches the dummy HF fixture
-    and many testable HF-style wrappers without depending on TinyMoEForCausalLM.
+    Adapters find RMSNorms and MoE modules. If modules expose routing traces
+    after forward, those traces are used. Otherwise the collector falls back to
+    hooks on the MoE input and router, then recomputes selected expert output
+    norms structurally for REAP-style scores.
     """
 
     if isinstance(model, TinyMoEForCausalLM):
         return collect_tiny_calibration(model, batches)
     adapter = adapter or get_adapter(model)
-    hidden_size = adapter.describe_architecture(model).hidden_size
+    architecture = adapter.describe_architecture(model)
+    hidden_size = architecture.hidden_size
     norms = adapter.iter_rmsnorms(model)
     moes = adapter.iter_moe_layers(model)
     hidden_sums = [torch.zeros(hidden_size, dtype=torch.float64) for _ in norms]
@@ -123,7 +124,15 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
     expert_reap_count = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
     weight_chunks = [[] for _ in moes]
     logit_chunks = [[] for _ in moes]
+    top_ks = [
+        min(len(adapter.get_routed_experts(moe)), max(1, int(architecture.moe_layers[idx].top_k)))
+        if idx < len(architecture.moe_layers) and architecture.moe_layers[idx].top_k
+        else _moe_top_k(moe, len(adapter.get_routed_experts(moe)))
+        for idx, moe in enumerate(moes)
+    ]
     handles = []
+    trace_states = [SimpleNamespace(hidden=None, router_logits=None) for _ in moes]
+    used_hook_fallback = False
 
     def make_hook(i: int):
         def hook(_module, _inputs, output):
@@ -136,33 +145,43 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
 
     for i, norm in enumerate(norms):
         handles.append(norm.register_forward_hook(make_hook(i)))
-    with torch.no_grad():
-        for batch in batches:
-            _ = model(input_ids=batch)
-            for layer_idx, moe in enumerate(moes):
-                topi = getattr(moe, "last_topk_indices", None)
-                topw = getattr(moe, "last_topk_weights", None)
-                logits = getattr(moe, "last_router_logits", None)
-                norm2 = getattr(moe, "last_expert_output_norm2", None)
-                if topi is None or topw is None or logits is None or norm2 is None:
-                    raise ValueError(f"MoE layer {layer_idx} did not expose routing traces during calibration")
-                n = len(adapter.get_routed_experts(moe))
-                topi = topi.reshape(-1, topi.shape[-1])
-                topw = topw.reshape(-1, topw.shape[-1])
-                logits = logits.reshape(-1, n)
-                norm2 = norm2.reshape(-1, n)
-                expert_freq[layer_idx] += expert_frequency(topi, n)
-                expert_soft[layer_idx] += expert_soft_importance(topi, topw, n)
-                reap_num, reap_count = expert_reap_numerator_counts(topi, topw, norm2, n)
-                expert_reap_num[layer_idx] += reap_num
-                expert_reap_count[layer_idx] += reap_count
-                dense_weights = torch.zeros(topi.shape[0], n)
-                for slot in range(topi.shape[1]):
-                    dense_weights.scatter_add_(1, topi[:, slot : slot + 1].cpu(), topw[:, slot : slot + 1].cpu())
-                weight_chunks[layer_idx].append(dense_weights)
-                logit_chunks[layer_idx].append(logits.cpu())
-    for h in handles:
-        h.remove()
+    for i, moe in enumerate(moes):
+        handles.append(moe.register_forward_pre_hook(_make_moe_input_hook(trace_states[i], hidden_size)))
+        handles.append(adapter.get_router(moe).register_forward_hook(_make_router_hook(trace_states[i])))
+    was_training = bool(getattr(model, "training", False))
+    try:
+        if hasattr(model, "eval"):
+            model.eval()
+        with torch.no_grad():
+            for batch in batches:
+                for state in trace_states:
+                    state.hidden = None
+                    state.router_logits = None
+                _ = model(input_ids=batch)
+                for layer_idx, moe in enumerate(moes):
+                    n = len(adapter.get_routed_experts(moe))
+                    traces = _resolve_moe_traces(adapter, moe, trace_states[layer_idx], n, top_ks[layer_idx])
+                    if traces.used_hook_fallback:
+                        used_hook_fallback = True
+                    topi = traces.topi.reshape(-1, traces.topi.shape[-1])
+                    topw = traces.topw.reshape(-1, traces.topw.shape[-1])
+                    logits = traces.logits.reshape(-1, n)
+                    norm2 = traces.norm2.reshape(-1, n)
+                    expert_freq[layer_idx] += expert_frequency(topi, n)
+                    expert_soft[layer_idx] += expert_soft_importance(topi, topw, n)
+                    reap_num, reap_count = expert_reap_numerator_counts(topi, topw, norm2, n)
+                    expert_reap_num[layer_idx] += reap_num
+                    expert_reap_count[layer_idx] += reap_count
+                    dense_weights = torch.zeros(topi.shape[0], n)
+                    for slot in range(topi.shape[1]):
+                        dense_weights.scatter_add_(1, topi[:, slot : slot + 1].cpu(), topw[:, slot : slot + 1].cpu())
+                    weight_chunks[layer_idx].append(dense_weights)
+                    logit_chunks[layer_idx].append(logits.cpu())
+    finally:
+        for h in handles:
+            h.remove()
+        if was_training and hasattr(model, "train"):
+            model.train()
     denom = max(1, len(batches))
     per_hidden = [s / max(1, c) for s, c in zip(hidden_sums, hidden_counts)]
     global_scores = sum(per_hidden) if per_hidden else torch.ones(hidden_size)
@@ -176,4 +195,89 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
         router_logits_similarity=[streaming_cosine(chunks) for chunks in logit_chunks],
         router_weights_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
         expert_outputs_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
+        representation="router_hook_recomputed_expert_outputs" if used_hook_fallback else "post_softmax_topk_weights",
     )
+
+
+def _make_moe_input_hook(state: SimpleNamespace, hidden_size: int):
+    def hook(_module, inputs):
+        value = _first_tensor(inputs)
+        if value is None or value.shape[-1] != hidden_size:
+            return
+        state.hidden = value.detach().reshape(-1, hidden_size)
+
+    return hook
+
+
+def _make_router_hook(state: SimpleNamespace):
+    def hook(_module, _inputs, output):
+        value = _first_tensor(output)
+        if value is not None:
+            state.router_logits = value.detach()
+
+    return hook
+
+
+def _first_tensor(value) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _resolve_moe_traces(adapter, moe, state: SimpleNamespace, num_experts: int, top_k: int) -> SimpleNamespace:
+    topi = getattr(moe, "last_topk_indices", None)
+    topw = getattr(moe, "last_topk_weights", None)
+    logits = getattr(moe, "last_router_logits", None)
+    norm2 = getattr(moe, "last_expert_output_norm2", None)
+    if topi is not None and topw is not None and logits is not None and norm2 is not None:
+        return SimpleNamespace(topi=topi, topw=topw, logits=logits, norm2=norm2, used_hook_fallback=False)
+    if state.hidden is None or state.router_logits is None:
+        raise ValueError("MoE layer did not expose routing traces and hook fallback did not capture router inputs/logits")
+    logits = state.router_logits.reshape(-1, num_experts)
+    if state.hidden.shape[0] != logits.shape[0]:
+        raise ValueError(
+            f"MoE hook fallback captured mismatched token counts: hidden={state.hidden.shape[0]}, "
+            f"router_logits={logits.shape[0]}"
+        )
+    topv, topi = torch.topk(logits, k=top_k, dim=-1)
+    topw = torch.softmax(topv, dim=-1)
+    norm2 = _selected_expert_output_norm2(adapter, moe, state.hidden, topi, num_experts)
+    return SimpleNamespace(topi=topi, topw=topw, logits=logits, norm2=norm2, used_hook_fallback=True)
+
+
+def _moe_top_k(moe, num_experts: int) -> int:
+    for name in ("top_k", "num_experts_per_tok", "moe_top_k"):
+        value = getattr(moe, name, None)
+        if value is not None:
+            return min(num_experts, max(1, int(value)))
+    return min(num_experts, 2)
+
+
+def _selected_expert_output_norm2(adapter, moe, hidden: torch.Tensor, topi: torch.Tensor, num_experts: int) -> torch.Tensor:
+    experts = adapter.get_routed_experts(moe)
+    norm2 = torch.zeros(topi.shape[0], num_experts, dtype=torch.float32)
+    for slot in range(topi.shape[1]):
+        for expert_idx, expert in enumerate(experts):
+            mask = topi[:, slot] == expert_idx
+            if not mask.any():
+                continue
+            expert_input = hidden[mask]
+            try:
+                device = next(expert.parameters()).device
+            except StopIteration:
+                device = expert_input.device
+            output = _first_tensor(expert(expert_input.to(device)))
+            if output is None:
+                continue
+            norm2[mask.cpu(), expert_idx] = output.detach().float().pow(2).sum(dim=-1).cpu()
+    return norm2
