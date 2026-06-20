@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -48,12 +50,25 @@ class WorkerAPIClient:
     def logs(self, job_id: str) -> dict[str, Any]:
         return self._json("GET", f"/v1/jobs/{job_id}/logs", None)
 
+    def artifacts(self, job_id: str) -> dict[str, Any]:
+        return self._json("GET", f"/v1/jobs/{job_id}/artifacts", None)
+
+    def artifacts_zip(self, job_id: str) -> bytes:
+        req = self._request("GET", f"/v1/jobs/{job_id}/artifacts.zip", None)
+        with request.urlopen(req, timeout=self.timeout_seconds) as response:
+            return response.read()
+
     def stop(self, job_id: str) -> dict[str, Any]:
         return self._json("POST", f"/v1/jobs/{job_id}/stop", {})
 
     def _json(self, method: str, path: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+        req = self._request(method, path, payload)
+        with request.urlopen(req, timeout=self.timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _request(self, method: str, path: str, payload: dict[str, Any] | None) -> request.Request:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
-        req = request.Request(
+        return request.Request(
             self.api_url + path,
             data=body,
             headers={
@@ -62,8 +77,6 @@ class WorkerAPIClient:
             },
             method=method,
         )
-        with request.urlopen(req, timeout=self.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
 
 
 class WorkerAPIRunner:
@@ -104,6 +117,16 @@ class WorkerAPIRunner:
     def logs(self, job_id: str) -> dict[str, Any]:
         return _redacted_payload(self.client.logs(job_id))
 
+    def artifacts(self, job_id: str) -> dict[str, Any]:
+        return _redacted_payload(self.client.artifacts(job_id))
+
+    def sync_outputs(self, job_id: str, output_dir: str | Path) -> dict[str, Any]:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        body = self.client.artifacts_zip(job_id)
+        extracted = _extract_zip_bytes(body, out)
+        return {"job_id": job_id, "output_dir": str(out.resolve()), "files": extracted}
+
     def stop(self, job_id: str) -> dict[str, Any]:
         return _redacted_payload(self.client.stop(job_id))
 
@@ -124,3 +147,19 @@ def _summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if config_text is not None:
         safe["config_text_bytes"] = len(config_text.encode("utf-8"))
     return safe
+
+
+def _extract_zip_bytes(body: bytes, output_dir: Path) -> list[str]:
+    extracted: list[str] = []
+    root = output_dir.resolve()
+    with zipfile.ZipFile(BytesIO(body)) as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            target = (root / member.filename).resolve()
+            if root not in {target, *target.parents}:
+                raise ValueError(f"worker artifact archive contains unsafe path: {member.filename}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(member))
+            extracted.append(str(target))
+    return extracted

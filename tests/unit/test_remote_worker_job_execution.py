@@ -1,6 +1,8 @@
 import json
 import sys
 import time
+import zipfile
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -16,10 +18,10 @@ from slimder_man.orchestration.worker_client import WorkerAPIClient, WorkerAPIRu
 from slimder_man.orchestration.worker_api import create_worker_app
 
 
-def _wait_for_terminal(client: TestClient, job_id: str, timeout: float = 5.0) -> dict:
+def _wait_for_terminal(client: TestClient, job_id: str, timeout: float = 5.0, headers: dict | None = None) -> dict:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        job = client.get(f"/v1/jobs/{job_id}").json()
+        job = client.get(f"/v1/jobs/{job_id}", headers=headers).json()
         if job["status"] in {"succeeded", "failed", "cancelled"}:
             return job
         time.sleep(0.05)
@@ -57,6 +59,40 @@ def test_worker_job_api_executes_local_subprocess_and_persists_state(tmp_path: P
     persisted = restarted_client.get(f"/v1/jobs/{created['id']}").json()
     assert persisted["status"] == "succeeded"
     assert persisted["log_path"] == finished["log_path"]
+
+
+def test_worker_job_api_lists_and_zips_artifacts(tmp_path: Path):
+    job_root = tmp_path / "worker"
+    artifact_dir = tmp_path / "artifacts"
+    nested = artifact_dir / "nested"
+    nested.mkdir(parents=True)
+    (nested / "result.txt").write_text("artifact-ok", encoding="utf-8")
+    try:
+        (nested / "linked.txt").symlink_to(nested / "result.txt")
+    except OSError:
+        pass
+    client = TestClient(create_worker_app(job_root=job_root, auth_token="token"))
+    headers = {"Authorization": "Bearer token"}
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "command": sys.executable,
+            "args": ["-c", "print('done')"],
+            "artifact_paths": [str(artifact_dir)],
+        },
+        headers=headers,
+    ).json()
+    finished = _wait_for_terminal(client, created["id"], headers=headers)
+
+    listing = client.get(f"/v1/jobs/{finished['id']}/artifacts", headers=headers).json()
+    zipped = client.get(f"/v1/jobs/{finished['id']}/artifacts.zip", headers=headers)
+
+    assert listing["artifacts"][0]["files"] == [{"path": "nested/result.txt", "bytes": 11}]
+    assert zipped.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(BytesIO(zipped.content)) as zf:
+        assert "artifacts/nested/linked.txt" not in zf.namelist()
+        assert zf.read("artifacts/nested/result.txt") == b"artifact-ok"
 
 
 def test_worker_job_api_can_cancel_running_local_subprocess(tmp_path: Path):
@@ -300,6 +336,40 @@ def test_worker_api_client_preflight_uses_auth_header(monkeypatch):
     assert captured["timeout"] == 3
 
 
+def test_worker_api_runner_syncs_artifact_zip_and_rejects_unsafe_paths(tmp_path: Path):
+    config_path = tmp_path / "worker.yaml"
+    cfg = SlimderConfig(project={"paper_faithful": False}, runtime={"worker": {"api_url": "http://worker.example"}})
+    save_config(cfg, config_path)
+
+    class FakeClient(WorkerAPIClient):
+        def __init__(self, body: bytes):
+            super().__init__("http://worker.example")
+            self.body = body
+
+        def artifacts_zip(self, job_id):
+            assert job_id == "job-1"
+            return self.body
+
+    good_buffer = BytesIO()
+    with zipfile.ZipFile(good_buffer, "w") as zf:
+        zf.writestr("run/result.txt", "ok")
+
+    sync = WorkerAPIRunner(config_path, cfg, client=FakeClient(good_buffer.getvalue())).sync_outputs("job-1", tmp_path / "synced")
+
+    assert Path(sync["files"][0]).read_text(encoding="utf-8") == "ok"
+
+    bad_buffer = BytesIO()
+    with zipfile.ZipFile(bad_buffer, "w") as zf:
+        zf.writestr("../escape.txt", "bad")
+
+    try:
+        WorkerAPIRunner(config_path, cfg, client=FakeClient(bad_buffer.getvalue())).sync_outputs("job-1", tmp_path / "bad")
+    except ValueError as exc:
+        assert "unsafe path" in str(exc)
+    else:
+        raise AssertionError("worker sync should reject unsafe zip paths")
+
+
 def test_cli_launch_worker_uses_worker_api_runner(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "worker.yaml"
     cfg = SlimderConfig(
@@ -366,6 +436,14 @@ def test_cli_worker_lifecycle_commands_use_worker_api_runner(monkeypatch, tmp_pa
             calls.append(("logs", job_id))
             return {"id": job_id, "logs": ["ok"]}
 
+        def artifacts(self, job_id):
+            calls.append(("artifacts", job_id))
+            return {"id": job_id, "artifacts": []}
+
+        def sync_outputs(self, job_id, out):
+            calls.append(("sync", job_id, out))
+            return {"job_id": job_id, "output_dir": str(out), "files": []}
+
         def stop(self, job_id):
             calls.append(("stop", job_id))
             return {"id": job_id, "status": "cancelled"}
@@ -376,18 +454,26 @@ def test_cli_worker_lifecycle_commands_use_worker_api_runner(monkeypatch, tmp_pa
     preflight = runner.invoke(app, ["worker-preflight", "--config", str(config_path), "--json"])
     status = runner.invoke(app, ["worker-status", "--config", str(config_path), "--job-id", "job-1", "--json"])
     logs = runner.invoke(app, ["worker-logs", "--config", str(config_path), "--job-id", "job-1", "--json"])
+    artifacts = runner.invoke(app, ["worker-artifacts", "--config", str(config_path), "--job-id", "job-1", "--json"])
+    sync = runner.invoke(app, ["worker-sync", "--config", str(config_path), "--job-id", "job-1", "--out", str(tmp_path / "synced"), "--json"])
     stop = runner.invoke(app, ["worker-stop", "--config", str(config_path), "--job-id", "job-1", "--json"])
 
     assert preflight.exit_code == 0, preflight.output
     assert status.exit_code == 0, status.output
     assert logs.exit_code == 0, logs.output
+    assert artifacts.exit_code == 0, artifacts.output
+    assert sync.exit_code == 0, sync.output
     assert stop.exit_code == 0, stop.output
     assert json.loads(preflight.output)["preflight"] == {"python": True}
     assert json.loads(status.output)["job"]["status"] == "running"
     assert json.loads(logs.output)["logs"]["logs"] == ["ok"]
+    assert json.loads(artifacts.output)["artifacts"]["artifacts"] == []
+    assert json.loads(sync.output)["sync"]["files"] == []
     assert json.loads(stop.output)["job"]["status"] == "cancelled"
     assert ("status", "job-1") in calls
     assert ("logs", "job-1") in calls
+    assert ("artifacts", "job-1") in calls
+    assert ("sync", "job-1", tmp_path / "synced") in calls
     assert ("stop", "job-1") in calls
 
 

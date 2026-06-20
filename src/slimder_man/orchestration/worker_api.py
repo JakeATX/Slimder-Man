@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hmac
+import io
 import os
 from pathlib import Path
 from typing import Literal
+import zipfile
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -68,6 +70,35 @@ def create_worker_app(
     def logs(job_id: str):
         return jobs.logs(job_id)
 
+    @app.get("/v1/jobs/{job_id}/artifacts")
+    def artifacts(job_id: str):
+        job = jobs.get(job_id)
+        if job["status"] == "missing":
+            raise HTTPException(status_code=404, detail="job not found")
+        return {"id": job_id, "artifacts": _artifact_listing(job)}
+
+    @app.get("/v1/jobs/{job_id}/artifacts.zip")
+    def artifacts_zip(job_id: str):
+        job = jobs.get(job_id)
+        if job["status"] == "missing":
+            raise HTTPException(status_code=404, detail="job not found")
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root_text in job.get("artifact_paths", []):
+                root = Path(root_text)
+                if root.is_file():
+                    if not root.is_symlink():
+                        zf.write(root, arcname=root.name)
+                elif root.is_dir():
+                    for path in sorted(root.rglob("*")):
+                        if path.is_file() and not path.is_symlink():
+                            zf.write(path, arcname=str(Path(root.name) / path.relative_to(root)))
+        return Response(
+            content=buffer.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{job_id}_artifacts.zip"'},
+        )
+
     @app.post("/v1/jobs/{job_id}/stop")
     def stop(job_id: str):
         return jobs.stop(job_id)
@@ -101,3 +132,21 @@ def _request_token(request: Request) -> str | None:
     if header.lower().startswith("bearer "):
         return header[7:].strip()
     return request.headers.get("x-slimder-worker-token")
+
+
+def _artifact_listing(job: dict) -> list[dict]:
+    rows = []
+    for root_text in job.get("artifact_paths", []):
+        root = Path(root_text)
+        if root.is_file():
+            rows.append({"root": str(root), "files": [{"path": root.name, "bytes": root.stat().st_size}]})
+        elif root.is_dir():
+            files = [
+                {"path": path.relative_to(root).as_posix(), "bytes": path.stat().st_size}
+                for path in sorted(root.rglob("*"))
+                if path.is_file() and not path.is_symlink()
+            ]
+            rows.append({"root": str(root), "files": files})
+        else:
+            rows.append({"root": str(root), "missing": True, "files": []})
+    return rows

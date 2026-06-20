@@ -16,8 +16,7 @@ This v0.1 implementation provides:
   MoE detection, sparse layer indices, depth pruning, width slicing, expert
   pruning/merge, router transforms, and finite forward validation;
 - local, SSH, SkyPilot, and worker-runner surfaces with dry-run plans, executable
-  runner APIs, worker submit/status/log/stop controls, SSH/SkyPilot sync
-  operations, and secret redaction.
+  runner APIs, log streaming, stop/sync operations, and secret redaction.
 
 Real Qwen3-Next-80B work remains hardware-gated: local full-model execution
 requires explicit `runtime.local.allow_full_model_run=true`, and default CI uses
@@ -65,6 +64,8 @@ slimder worker --host 0.0.0.0 --auth-token change-me
 slimder worker-preflight --config path/to/worker_config.yaml --json
 slimder worker-status --config path/to/worker_config.yaml --job-id JOB_ID --json
 slimder worker-logs --config path/to/worker_config.yaml --job-id JOB_ID --json
+slimder worker-artifacts --config path/to/worker_config.yaml --job-id JOB_ID --json
+slimder worker-sync --config path/to/worker_config.yaml --job-id JOB_ID --out runs/worker_copy --json
 slimder worker-stop --config path/to/worker_config.yaml --job-id JOB_ID --json
 ```
 
@@ -75,7 +76,8 @@ For worker configs, set `runtime.worker.api_url` to a running `slimder worker`
 service; launch submits the YAML as job input so the worker does not need a
 shared local config path. Worker defaults to `127.0.0.1`; non-local binds
 require `--auth-token` or `SLIMDER_WORKER_TOKEN` because `/v1/jobs` executes
-local subprocesses.
+local subprocesses. Treat the worker API as trusted infrastructure; artifact
+sync packages the job's recorded artifact paths for retrieval.
 
 The package targets Python `>=3.11,<3.13`.
 GitHub Actions runs unit and non-GPU smoke tests on Python 3.11 and 3.12.

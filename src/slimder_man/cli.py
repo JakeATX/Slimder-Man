@@ -697,6 +697,21 @@ def worker_logs(config: Path = typer.Option(..., "--config"), job_id: str = type
     _echo({"backend": "worker", "logs": _worker_runner_from_config(config).logs(job_id)}, json_output)
 
 
+@app.command("worker-artifacts")
+def worker_artifacts(config: Path = typer.Option(..., "--config"), job_id: str = typer.Option(..., "--job-id"), json_output: bool = typer.Option(False, "--json")) -> None:
+    _echo({"backend": "worker", "artifacts": _worker_runner_from_config(config).artifacts(job_id)}, json_output)
+
+
+@app.command("worker-sync")
+def worker_sync(
+    config: Path = typer.Option(..., "--config"),
+    job_id: str = typer.Option(..., "--job-id"),
+    out: Path = typer.Option(..., "--out"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    _echo({"backend": "worker", "sync": _worker_runner_from_config(config).sync_outputs(job_id, out)}, json_output)
+
+
 @app.command("worker-stop")
 def worker_stop(config: Path = typer.Option(..., "--config"), job_id: str = typer.Option(..., "--job-id"), json_output: bool = typer.Option(False, "--json")) -> None:
     _echo({"backend": "worker", "job": _worker_runner_from_config(config).stop(job_id)}, json_output)
