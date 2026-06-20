@@ -55,7 +55,7 @@ def test_progressive_stage_runner_wires_stage_specific_configs(tmp_path):
 
     assert [stage["tokens"] for stage in result["stages"]] == [25, 75]
     assert ("compress", 1, 16, 8, str(tmp_path / "progressive" / "stage_1" / "compressed")) in seen
-    assert ("compress", 2, 12, 4, str(tmp_path / "progressive" / "stage_2" / "compressed")) in seen
+    assert ("compress", 1, 12, 4, str(tmp_path / "progressive" / "stage_2" / "compressed")) in seen
     assert result["global_total_steps"] == 3
     assert ("train", 25, 1, str(tmp_path / "progressive" / "stage_1" / "training")) in seen
     assert ("train", 75, 2, str(tmp_path / "progressive" / "stage_2" / "training")) in seen
@@ -84,7 +84,10 @@ def test_progressive_stage_runner_executes_real_tiny_stages(tmp_path):
     assert stage_1_manifest["experts"]["layers"][0]["score_artifact"]["tensor"] == "soft_logits"
     assert stage_2_manifest["experts"]["layers"][0]["similarity_artifact"]["metric"] == "router_weights"
     assert stage_1_manifest["stage_provenance"]["stage"] == 1
-    assert Path(stage_2_manifest["stage_provenance"]["previous_checkpoint"]).parts[-2:] == ("stage_1", "compressed")
+    assert Path(stage_2_manifest["stage_provenance"]["previous_checkpoint"]).parts[-2:] == ("training", "final")
+    assert stage_2_manifest["target"]["remove_last_n_layers"] == 1
+    assert stage_2_manifest["stage_provenance"]["cumulative_target"]["remove_last_n_layers"] == 2
+    assert stage_2_manifest["stage_provenance"]["cumulative_target"]["layers"] == 2
     assert (tmp_path / "real_progressive" / "stage_2" / "training" / "training_report.md").exists()
     assert result["global_total_steps"] == 2
     assert result["stages"][0]["training"]["global_step"] == 1

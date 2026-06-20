@@ -36,10 +36,19 @@ def stage_plans_for_tiny(model: TinyMoEForCausalLM, cfg: SlimderConfig) -> list[
     )
 
 
-def config_for_stage(base_cfg: SlimderConfig, plan: StagePlan, teacher: TinyMoEForCausalLM) -> SlimderConfig:
+def config_for_stage(
+    base_cfg: SlimderConfig,
+    plan: StagePlan,
+    teacher: TinyMoEForCausalLM,
+    source_layers: int | None = None,
+) -> SlimderConfig:
+    teacher_layers = len(teacher.layers)
+    current_layers = source_layers if source_layers is not None else teacher_layers
+    desired_layers = max(1, teacher_layers - plan.remove_last_n_layers)
+    remove_from_source = max(0, current_layers - desired_layers)
     target = base_cfg.compression.target.model_copy(
         update={
-            "remove_last_n_layers": plan.remove_last_n_layers,
+            "remove_last_n_layers": remove_from_source,
             "hidden_size": plan.hidden_size,
             "routed_experts": plan.routed_experts if plan.routed_experts is not None else teacher.config.num_routed_experts,
             "routed_top_k": plan.top_k if plan.top_k is not None else teacher.config.top_k,
@@ -85,15 +94,19 @@ def run_tiny_progressive_stages(
     global_total_steps = sum(stage_steps)
     global_step_offset = 0
     previous_checkpoint: str | None = None
-    arch = describe_model(teacher)
+    source_model = teacher
+    teacher_layers = len(teacher.layers)
+    source_layers = teacher_layers
     for plan, train_steps in zip(plans, stage_steps, strict=True):
-        stage_cfg = config_for_stage(cfg, plan, teacher)
+        stage_cfg = config_for_stage(cfg, plan, teacher, source_layers=source_layers)
         stage_cfg = stage_cfg.model_copy(update={"training": stage_cfg.training.model_copy(update={"train_steps": train_steps})})
         stage_dir = out_dir / f"stage_{plan.stage}"
         analysis_dir = stage_dir / "analysis"
-        _, source_manifest = sample_calibration_tokens(stage_cfg.calibration, vocab_size=teacher.config.vocab_size)
-        cal = calibrate_fn(teacher, stage_cfg)
+        arch = describe_model(source_model)
+        _, source_manifest = sample_calibration_tokens(stage_cfg.calibration, vocab_size=source_model.config.vocab_size)
+        cal = calibrate_fn(source_model, stage_cfg)
         write_calibration_artifacts(analysis_dir, stage_cfg, cal, source_manifest, arch)
+        cumulative_target_layers = max(1, teacher_layers - plan.remove_last_n_layers)
         stage_provenance = {
             "stage": plan.stage,
             "total_stages": len(plans),
@@ -102,6 +115,13 @@ def run_tiny_progressive_stages(
             "source": "teacher" if previous_checkpoint is None else "previous_stage_checkpoint",
             "previous_checkpoint": previous_checkpoint,
             "final_stage": plan.stage == len(plans),
+            "cumulative_target": {
+                "remove_last_n_layers": plan.remove_last_n_layers,
+                "hidden_size": plan.hidden_size,
+                "layers": cumulative_target_layers,
+                "routed_experts": plan.routed_experts,
+                "top_k": plan.top_k,
+            },
         }
         compress_kwargs = {
             "calibration_manifest_path": analysis_dir / "calibration_manifest.json",
@@ -115,7 +135,7 @@ def run_tiny_progressive_stages(
             for key, value in compress_kwargs.items()
             if accepts_kwargs or key in signature.parameters
         }
-        student, manifest = compress_fn(teacher, stage_cfg, cal, stage_dir / "compressed", **supported_kwargs)
+        student, manifest = compress_fn(source_model, stage_cfg, cal, stage_dir / "compressed", **supported_kwargs)
         train_kwargs = {
             "global_step_offset": global_step_offset,
             "global_total_steps": global_total_steps,
@@ -129,7 +149,13 @@ def run_tiny_progressive_stages(
         }
         train = train_fn(teacher, student, stage_cfg, stage_dir / "training", **supported_train_kwargs)
         global_step_offset += train_steps
-        previous_checkpoint = str(stage_dir / "compressed")
+        train_checkpoint = train.get("checkpoint")
+        previous_checkpoint = str(train_checkpoint or stage_dir / "compressed")
+        if train_checkpoint and Path(train_checkpoint).exists():
+            source_model = TinyMoEForCausalLM.from_pretrained(train_checkpoint)
+        else:
+            source_model = student
+        source_layers = cumulative_target_layers
         stages.append(
             {
                 "stage": plan.stage,

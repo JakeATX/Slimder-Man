@@ -38,8 +38,9 @@ def test_cli_run_executes_progressive_tiny_stages(tmp_path: Path):
     assert stages[0]["manifest"]["target"]["remove_last_n_layers"] == 1
     assert stages[0]["manifest"]["target"]["routed_experts"] == 8
     assert stages[1]["manifest"]["target"]["hidden_size"] == 12
-    assert stages[1]["manifest"]["target"]["remove_last_n_layers"] == 2
+    assert stages[1]["manifest"]["target"]["remove_last_n_layers"] == 1
     assert stages[1]["manifest"]["target"]["routed_experts"] == 4
+    assert stages[1]["manifest"]["stage_provenance"]["cumulative_target"]["remove_last_n_layers"] == 2
     stage_1_manifest_path = tmp_path / "run" / "progressive" / "stage_1" / "compressed" / "compression_manifest.json"
     stage_2_manifest_path = tmp_path / "run" / "progressive" / "stage_2" / "compressed" / "compression_manifest.json"
     assert stage_1_manifest_path.exists()
@@ -52,8 +53,9 @@ def test_cli_run_executes_progressive_tiny_stages(tmp_path: Path):
     assert stage_1_manifest["stage_provenance"]["previous_checkpoint"] is None
     assert stage_2_manifest["stage_provenance"]["stage"] == 2
     assert stage_2_manifest["stage_provenance"]["source"] == "previous_stage_checkpoint"
-    assert Path(stage_2_manifest["stage_provenance"]["previous_checkpoint"]).parts[-2:] == ("stage_1", "compressed")
+    assert Path(stage_2_manifest["stage_provenance"]["previous_checkpoint"]).parts[-2:] == ("training", "final")
     assert stage_2_manifest["stage_provenance"]["final_stage"] is True
+    assert stage_2_manifest["stage_provenance"]["cumulative_target"]["layers"] == 2
     for stage_manifest in (stage_1_manifest, stage_2_manifest):
         calibration = stage_manifest["calibration_artifacts"]
         assert calibration["manifest_sha256"] == sha256_file(calibration["manifest_path"])
