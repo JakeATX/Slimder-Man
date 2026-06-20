@@ -12,5 +12,8 @@ def test_allocator_budget_protection_and_monotonicity():
 
 
 def test_infeasible_budget_fails():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc:
         allocate_bits([QuantItem("router", 10, 1, protected_bits=16)], [2, 4], 4)
+    message = str(exc.value)
+    assert "minimum_feasible_avg_bits" in message
+    assert "router(size=10, protected_bits=16)" in message

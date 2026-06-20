@@ -18,9 +18,7 @@ class LocalPlan:
 
 def _quote_arg(value: str | Path) -> str:
     text = str(value)
-    if not text or any(char.isspace() for char in text):
-        return '"' + text.replace('"', '\\"') + '"'
-    return text
+    return '"' + text.replace('"', '\\"') + '"'
 
 
 def local_preflight(cfg: SlimderConfig, repo_root: str | Path = ".") -> list[dict[str, str]]:
@@ -66,7 +64,7 @@ def local_dry_run_commands(config_path: str | Path, cfg: SlimderConfig) -> Local
     else:
         commands = [
             f"python -m slimder_man.cli analyze {config_arg} --json",
-            f"python -m slimder_man.cli recommend --config {config_arg} --preset {cfg.compression.preset} --json",
+            f"python -m slimder_man.cli recommend --config {config_arg} --preset {cfg.compression.preset} --write-config {config_arg} --json",
             f"python -m slimder_man.cli compress --config {config_arg} --stage 1 --json",
             f"python -m slimder_man.cli distill {config_arg} --stage 1 --json",
             f"python -m slimder_man.cli eval --checkpoint {output_dir} --json",

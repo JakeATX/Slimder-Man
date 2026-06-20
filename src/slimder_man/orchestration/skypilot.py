@@ -79,7 +79,7 @@ def skypilot_yaml(config_path: str | Path, cfg: SlimderConfig) -> str:
             "set -euo pipefail",
             "mkdir -p logs",
             f"python -m slimder_man.cli analyze {remote_config} --json | tee logs/analyze.log",
-            f"python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --json | tee logs/recommend.log",
+            f"python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --write-config {remote_config} --json | tee logs/recommend.log",
             f"python -m slimder_man.cli compress --config {remote_config} --stage 1 --json | tee logs/compress.log",
             f"python -m slimder_man.cli distill {remote_config} --stage 1 --json | tee logs/distill.log",
             f"python -m slimder_man.cli eval --checkpoint {remote_run}/training/final --json | tee logs/eval.log",

@@ -15,7 +15,6 @@ from slimder_man.utils.json import write_json
 SIMILARITY_ATTRS = {
     "router_logits": "router_logits_similarity",
     "router_weights": "router_weights_similarity",
-    "expert_outputs": "expert_outputs_similarity",
 }
 
 
@@ -82,9 +81,11 @@ def write_calibration_artifacts(
     _record_artifact(out_path, artifacts, keep_path, "hidden_keep_indices")
 
     layer_summaries = []
-    for layer_idx, (freq, soft, reap) in enumerate(
+    expert_layer_indices = calibration.expert_layer_indices or list(range(len(calibration.expert_frequency)))
+    for ordinal, (freq, soft, reap) in enumerate(
         zip(calibration.expert_frequency, calibration.expert_soft, calibration.expert_reap, strict=True)
     ):
+        layer_idx = int(expert_layer_indices[ordinal])
         stats_path = out_path / f"expert_stats_layer_{layer_idx}.safetensors"
         save_file(
             {

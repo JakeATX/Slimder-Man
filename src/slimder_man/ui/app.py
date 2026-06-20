@@ -109,6 +109,37 @@ def _json_or_error(proc: subprocess.CompletedProcess[str]) -> str:
     return proc.stdout if proc.returncode == 0 else proc.stderr
 
 
+def apply_candidate_to_yaml(yaml_text: str, preset: str = "balanced_50", candidate_id: str = "") -> str:
+    if preset == "all":
+        raise ValueError("Choose one preset before applying a candidate; preset=all is only for comparison.")
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "config.yaml"
+        path.write_text(yaml_text, encoding="utf-8")
+        cfg = _config_from_yaml(yaml_text)
+        chosen = candidate_id or f"{preset}_1"
+        argv = [
+            sys.executable,
+            "-m",
+            "slimder_man.cli",
+            "recommend",
+            "--config",
+            str(path),
+            "--preset",
+            preset,
+            "--candidate-id",
+            chosen,
+            "--write-config",
+            str(path),
+            "--json",
+        ]
+        if cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe":
+            argv.append("--config-only")
+        proc = subprocess.run(argv, text=True, capture_output=True)
+        if proc.returncode != 0:
+            raise ValueError(proc.stderr or proc.stdout)
+        return path.read_text(encoding="utf-8")
+
+
 def run_cli_with_yaml(
     yaml_text: str,
     command: str,
@@ -275,6 +306,7 @@ def create_app(test_mode: bool = False):
                     aggressive_btn = gr.Button("80 percent")
                     extreme_btn = gr.Button("90 percent")
                 recommend_btn = gr.Button("Generate Recommendations")
+                apply_candidate_btn = gr.Button("Apply Top Candidate")
                 recommend_out = gr.Code(language="json", label="Recommendation Output")
             with gr.Tab("Compression"):
                 stage = gr.Number(value=1, precision=0, label="Stage")
@@ -412,6 +444,11 @@ def create_app(test_mode: bool = False):
             inputs=[preset, *config_inputs],
             outputs=[recommend_out],
         )
+        apply_candidate_btn.click(
+            apply_candidate_to_yaml,
+            inputs=[output, preset],
+            outputs=[output],
+        ).then(config_warnings, inputs=[output], outputs=[warnings_out])
         compress_btn.click(
             lambda stage_value, selected, *args: _run_from_ui("compress", *args, preset_value=selected, stage_value=stage_value),
             inputs=[stage, preset, *config_inputs],

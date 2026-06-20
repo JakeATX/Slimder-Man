@@ -79,6 +79,8 @@ def fake_quantize_model(
     }
     manifest = {
         "backend": "fake_symmetric_uniform",
+        "production_ready": False,
+        "export_format": "dequantized_fake_quant",
         "model_type": arch["model_type"],
         "target_avg_bits": target_avg_bits,
         "allowed_bits": bits,
@@ -101,7 +103,7 @@ def fake_quantize_model(
     }
     manifest["export_manifest"] = "quant_export_manifest.json"
     write_json(out / "fake_quant_manifest.json", manifest)
-    write_quant_export_manifest(out, "fake_symmetric_uniform", manifest)
+    write_quant_export_manifest(out, "fake_symmetric_uniform", manifest, export_format="dequantized_fake_quant")
     return manifest
 
 

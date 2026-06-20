@@ -86,7 +86,7 @@ class WorkerJobStore:
         argv = self._argv(req)
         cwd = str(Path(req.cwd).resolve()) if req.cwd else None
         env = os.environ.copy()
-        env.setdefault("CUDA_VISIBLE_DEVICES", "")
+        visible_devices = env.get("CUDA_VISIBLE_DEVICES", "<unset>")
 
         log_file = self._log_path(job_id).open("a", encoding="utf-8")
         try:
@@ -103,7 +103,13 @@ class WorkerJobStore:
             log_file.close()
             return self._update(job_id, status="failed", finished_at=time.time(), error=str(exc), returncode=None)
 
-        job = self._update(job_id, status="running", started_at=time.time(), pid=process.pid)
+        job = self._update(
+            job_id,
+            status="running",
+            started_at=time.time(),
+            pid=process.pid,
+            runtime={"cuda_visible_devices": visible_devices},
+        )
 
         def wait_for_process() -> None:
             try:

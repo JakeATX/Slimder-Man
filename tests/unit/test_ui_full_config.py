@@ -2,7 +2,7 @@ import json
 import yaml
 
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.ui.app import artifact_index, build_config_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command
+from slimder_man.ui.app import artifact_index, apply_candidate_to_yaml, build_config_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command
 
 
 def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
@@ -131,6 +131,20 @@ def test_ui_helpers_run_tiny_analyze_recommend_and_run(tmp_path):
     assert "training_report.md" in artifacts
     assert "training_report.md" in logs
     assert "No warnings." == config_warnings(yaml_text)
+
+
+def test_ui_apply_candidate_materializes_target_and_plan():
+    yaml_text = build_config_yaml(project_name="ui_apply", compression_preset="balanced_50")
+
+    applied_text = apply_candidate_to_yaml(yaml_text, "balanced_50")
+    applied = SlimderConfig.model_validate(yaml.safe_load(applied_text))
+
+    assert applied.compression.target.hidden_size == 12
+    assert applied.compression.target.remove_last_n_layers == 1
+    assert applied.compression.target.routed_experts == 4
+    assert applied.compression.target.routed_top_k == 2
+    assert applied.compression.plan is not None
+    assert applied.compression.plan.candidate_id == "balanced_50_1"
 
 
 def test_ui_command_uses_current_fields_without_generated_yaml(monkeypatch):

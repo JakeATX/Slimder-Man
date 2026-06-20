@@ -142,7 +142,7 @@ def ssh_command_plan(
             "recommend",
             _ssh_call(
                 ssh_base,
-                f"cd {remote_root} && python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --json > logs/recommend.log 2>&1",
+                f"cd {remote_root} && python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --write-config {remote_config} --json > logs/recommend.log 2>&1",
             ),
         ),
         SSHCommand(

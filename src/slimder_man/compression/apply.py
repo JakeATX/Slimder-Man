@@ -211,24 +211,33 @@ def _resolve_expert_importance(calibration: CalibrationResult, metric: str, laye
     }
     if metric not in metrics:
         raise ValueError(f"Unsupported expert importance metric {metric}")
-    return metrics[metric][layer_idx]
+    return metrics[metric][_calibration_ordinal_for_layer(calibration, layer_idx)]
 
 
 def _resolve_expert_similarity(calibration: CalibrationResult, metric: str, layer_idx: int) -> torch.Tensor:
     attr_by_metric = {
         "router_weights": "router_weights_similarity",
         "router_logits": "router_logits_similarity",
-        "expert_outputs": "expert_outputs_similarity",
     }
     if metric not in attr_by_metric:
         raise ValueError(f"Unsupported expert similarity metric {metric}")
     attr = attr_by_metric[metric]
     value = getattr(calibration, attr, None)
+    ordinal = _calibration_ordinal_for_layer(calibration, layer_idx)
     if value is None:
         if metric == "router_weights":
-            return calibration.expert_similarity[layer_idx]
+            return calibration.expert_similarity[ordinal]
         raise ValueError(f"Calibration result does not include {metric} similarity")
-    return value[layer_idx]
+    return value[ordinal]
+
+
+def _calibration_ordinal_for_layer(calibration: CalibrationResult, layer_idx: int) -> int:
+    indices = calibration.expert_layer_indices
+    if indices is None:
+        return layer_idx
+    if layer_idx not in indices:
+        raise ValueError(f"Calibration result does not include expert metrics for transformer layer {layer_idx}")
+    return indices.index(layer_idx)
 
 
 def _prune_experts(experts: list[torch.nn.Module], scores: torch.Tensor, target_experts: int):
@@ -305,6 +314,7 @@ def compress_tiny_model(
         "seed": cfg.project.seed,
         "provenance": config_provenance(cfg, source_config_path),
         "calibration_artifacts": calibration_ref,
+        "compression_plan": cfg.compression.plan.model_dump(mode="json") if cfg.compression.plan else None,
         "progressive": cfg.progressive.model_dump(mode="json"),
         "stage_provenance": stage_provenance or {},
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
@@ -357,6 +367,7 @@ def compress_model(
     calibration_manifest_path: str | Path | None = None,
     source_config_path: str | Path | None = None,
     stage_provenance: dict | None = None,
+    in_place: bool = True,
 ):
     if isinstance(model, TinyMoEForCausalLM):
         return compress_tiny_model(
@@ -369,11 +380,15 @@ def compress_model(
             stage_provenance=stage_provenance,
         )
 
-    student = deepcopy(model)
+    before_params = sum(p.numel() for p in model.parameters())
+    student = model if in_place else deepcopy(model)
     adapter = adapter or get_adapter(student)
     target = cfg.compression.target
     calibration_ref = _calibration_manifest_reference(calibration_manifest_path)
+    source_arch = adapter.describe_architecture(student)
     source_layers = len(adapter.iter_transformer_blocks(student))
+    source_moe_layer_indices = [int(info.layer_idx) for info in source_arch.moe_layers]
+    source_top_k = getattr(getattr(model, "config", None), "num_experts_per_tok", target.routed_top_k)
     remove_last_n_layers = resolve_remove_last_n(source_layers, target.remove_last_n_layers, target.depth_remove_fraction)
     keep_blocks = compute_depth_keep_indices(source_layers, remove_last_n_layers)
     adapter.drop_blocks(student, keep_blocks)
@@ -386,8 +401,9 @@ def compress_model(
         keep_idx = keep_tensor.tolist()
 
     expert_layers = []
+    kept_moe_layer_indices = [idx for idx in source_moe_layer_indices if idx in keep_blocks]
     for layer_idx, moe in enumerate(adapter.iter_moe_layers(student)):
-        original_layer_idx = keep_blocks[layer_idx] if layer_idx < len(keep_blocks) else layer_idx
+        original_layer_idx = kept_moe_layer_indices[layer_idx] if layer_idx < len(kept_moe_layer_indices) else layer_idx
         scores = _resolve_expert_importance(calibration, cfg.compression.experts.importance_metric, original_layer_idx)
         sim = _resolve_expert_similarity(calibration, cfg.compression.experts.similarity_metric, original_layer_idx)
         experts = adapter.get_routed_experts(moe)
@@ -425,6 +441,12 @@ def compress_model(
         "seed": cfg.project.seed,
         "provenance": config_provenance(cfg, source_config_path),
         "calibration_artifacts": calibration_ref,
+        "compression_plan": cfg.compression.plan.model_dump(mode="json") if cfg.compression.plan else None,
+        "memory": {
+            "compression_mode": "in_place_destructive" if in_place else "copy_for_tests",
+            "source_model_duplicated": not in_place,
+            "peak_model_copies_estimate": 1 if in_place else 2,
+        },
         "progressive": cfg.progressive.model_dump(mode="json"),
         "stage_provenance": stage_provenance or {},
         "calibration": {"sample_count": cfg.calibration.sample_count, "sequence_length": cfg.calibration.sequence_length},
@@ -432,8 +454,8 @@ def compress_model(
         "depth": {"method": "last_layers", "kept_block_indices": keep_blocks},
         "width": {"method": "rmsnorm_mean_abs", "hidden_keep_indices": keep_idx, "hidden_size_before": current_hidden, "hidden_size_after": target.hidden_size},
         "experts": {"method": cfg.compression.experts.method, "importance_metric": cfg.compression.experts.importance_metric, "similarity_metric": cfg.compression.experts.similarity_metric, "layers": expert_layers},
-        "router": {"row_strategy": cfg.compression.experts.router_row_strategy, "top_k_before": getattr(getattr(model, "config", None), "num_experts_per_tok", target.routed_top_k), "top_k_after": target.routed_top_k},
-        "param_counts": {"before": sum(p.numel() for p in model.parameters()), "after": sum(p.numel() for p in student.parameters()), "actual_after": sum(p.numel() for p in student.parameters())},
+        "router": {"row_strategy": cfg.compression.experts.router_row_strategy, "top_k_before": source_top_k, "top_k_after": target.routed_top_k},
+        "param_counts": {"before": before_params, "after": sum(p.numel() for p in student.parameters()), "actual_after": sum(p.numel() for p in student.parameters())},
     }
     adapter.update_config_after_compression(student, manifest)
     input_ids = torch.randint(0, arch.vocab_size, (1, min(8, max(2, arch.vocab_size))))

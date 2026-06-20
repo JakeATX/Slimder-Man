@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from slimder_man.adapters.generic_hf_moe import GenericHfMoeAdapter
 from slimder_man.adapters.registry import get_adapter
 from slimder_man.calibration.collectors import collect_calibration
 from slimder_man.calibration.datasets import sample_calibration_tokens
@@ -53,6 +54,34 @@ class NotATokenizer:
     pass
 
 
+def test_generic_adapter_replaces_nested_expert_container_used_by_forward():
+    class NestedMoe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.experts = nn.ModuleList([nn.Linear(2, 2, bias=False) for _ in range(3)])
+            self.mlp.gate = nn.Linear(2, 3, bias=False)
+            self.top_k = 2
+
+        def forward(self, x):
+            routed = self.mlp.gate(x)
+            return sum(expert(x) for expert in self.mlp.experts) + routed[:, :2]
+
+    moe = NestedMoe()
+    adapter = GenericHfMoeAdapter()
+    new_experts = [nn.Linear(2, 2, bias=False) for _ in range(2)]
+    router_rows = torch.ones(2, 2)
+
+    adapter.replace_experts(moe, new_experts, router_rows, new_top_k=1)
+
+    assert len(moe.mlp.experts) == 2
+    assert not hasattr(moe, "experts")
+    assert moe.mlp.gate.weight.shape == (2, 2)
+    assert moe.top_k == 1
+    out = moe(torch.ones(1, 2))
+    assert out.shape == (1, 2)
+
+
 def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     cfg = SlimderConfig(
         project={"output_dir": str(tmp_path), "paper_faithful": True},
@@ -81,7 +110,8 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
         deep=True,
         update={"compression": cfg.compression.model_copy(update={"target": cfg.compression.target.model_copy(update={"hidden_size": 32})})},
     )
-    depth_expert_student, _ = compress_model(teacher, depth_expert_cfg, calibration, adapter=adapter)
+    depth_teacher = DummyHfMoeForCausalLM()
+    depth_expert_student, _ = compress_model(depth_teacher, depth_expert_cfg, calibration, adapter=get_adapter(depth_teacher))
 
     student, manifest = compress_model(
         teacher,
@@ -115,6 +145,8 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     assert student.config.num_experts == 4
     assert manifest["width"]["hidden_size_before"] == 32
     assert manifest["width"]["hidden_size_after"] == 24
+    assert manifest["memory"]["compression_mode"] == "in_place_destructive"
+    assert manifest["memory"]["source_model_duplicated"] is False
     assert manifest["width"]["hidden_keep_indices"] == list(range(8, 32))
     assert manifest["param_counts"]["after"] < sum(p.numel() for p in depth_expert_student.parameters())
     assert manifest["provenance"]["normalized_config_sha256"]
@@ -151,10 +183,40 @@ def test_generic_hf_dummy_compresses_saves_and_reloads(tmp_path: Path):
     assert reloaded_out.logits.shape == (1, cfg.calibration.sequence_length, teacher.config.vocab_size)
     assert reloaded_out.loss is not None and torch.isfinite(reloaded_out.loss)
 
-    train = train_causal_lm_distill(teacher, reloaded, cfg, tmp_path / "training", batches[:2])
+    train = train_causal_lm_distill(DummyHfMoeForCausalLM(), reloaded, cfg, tmp_path / "training", batches[:2])
     assert train["global_step"] == 1
     assert train["logs"][0]["loss"] > 0
     assert (tmp_path / "training" / "final" / "model.safetensors").exists()
+
+
+def test_generic_compression_does_not_deepcopy_whole_model(monkeypatch, tmp_path: Path):
+    import copy
+    import slimder_man.compression.apply as apply_module
+
+    teacher = DummyHfMoeForCausalLM()
+    adapter = get_adapter(teacher)
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path), "paper_faithful": True},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        compression={"target": {"hidden_size": 32, "remove_last_n_layers": 0, "routed_experts": 4, "routed_top_k": 2}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+    calibration = collect_calibration(teacher, batches, adapter)
+    real_deepcopy = copy.deepcopy
+
+    def reject_whole_model_deepcopy(obj, memo=None):
+        if isinstance(obj, DummyHfMoeForCausalLM):
+            raise AssertionError("compress_model must not deepcopy the full source model")
+        return real_deepcopy(obj, memo)
+
+    monkeypatch.setattr(apply_module, "deepcopy", reject_whole_model_deepcopy)
+
+    student, manifest = compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "bounded")
+
+    assert student is teacher
+    assert manifest["memory"]["source_model_duplicated"] is False
+    assert manifest["param_counts"]["before"] > manifest["param_counts"]["after"]
 
 
 def test_generic_hf_compression_honors_torch_output_format(tmp_path: Path):
@@ -289,16 +351,21 @@ def test_hf_compression_rejects_invalid_or_clobbering_tokenizer(tmp_path: Path):
         compression={"target": {"hidden_size": 24, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
         calibration={"sample_count": 2, "sequence_length": 8},
     )
-    teacher = DummyHfMoeForCausalLM()
-    adapter = get_adapter(teacher)
-    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
-    calibration = collect_calibration(teacher, batches, adapter)
+    def fresh_inputs():
+        teacher = DummyHfMoeForCausalLM()
+        adapter = get_adapter(teacher)
+        batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
+        calibration = collect_calibration(teacher, batches, adapter)
+        return teacher, adapter, calibration
 
     with pytest.raises(ValueError, match="does not expose save_pretrained"):
+        teacher, adapter, calibration = fresh_inputs()
         compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "bad_tokenizer", tokenizer=NotATokenizer())
     with pytest.raises(ValueError, match="modified model config.json"):
+        teacher, adapter, calibration = fresh_inputs()
         compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "clobber", tokenizer=ConfigClobberingTokenizer())
     with pytest.raises(ValueError, match="removed model config.json"):
+        teacher, adapter, calibration = fresh_inputs()
         compress_model(teacher, cfg, calibration, adapter=adapter, output_dir=tmp_path / "delete", tokenizer=ConfigDeletingTokenizer())
 
 

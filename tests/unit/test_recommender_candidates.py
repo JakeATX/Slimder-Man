@@ -1,6 +1,8 @@
 import pytest
 
+from slimder_man.analyze.plans import apply_recommendation_to_config, architecture_fingerprint, validate_applied_plan
 from slimder_man.analyze.recommender import recommend
+from slimder_man.config.schema import SlimderConfig
 
 
 def qwen_architecture() -> dict:
@@ -84,3 +86,30 @@ def test_qwen_non_anchor_presets_are_architecture_relative_not_tiny_constants():
 def test_unknown_preset_raises():
     with pytest.raises(ValueError, match="Unknown preset"):
         recommend(qwen_architecture(), "missing")
+
+
+def test_apply_recommendation_materializes_qwen_anchor_target_and_fingerprint():
+    cfg = SlimderConfig(teacher={"load_mode": "transformers", "model_id_or_path": "Qwen/Qwen3-Next-80B-A3B-Instruct"})
+    cfg, plan = apply_recommendation_to_config(cfg, qwen_architecture(), preset="slimqwen_anchor", candidate_id="slimqwen_anchor_1")
+
+    assert cfg.compression.target.hidden_size == 1536
+    assert cfg.compression.target.remove_last_n_layers == 12
+    assert cfg.compression.target.routed_experts == 256
+    assert cfg.compression.target.routed_top_k == 8
+    assert cfg.compression.plan is not None
+    assert cfg.compression.plan.source_architecture_fingerprint == architecture_fingerprint(qwen_architecture())
+    assert plan["candidate"]["candidate_id"] == "slimqwen_anchor_1"
+    validate_applied_plan(cfg, qwen_architecture())
+
+
+def test_applied_plan_rejects_architecture_and_target_mismatches():
+    cfg = SlimderConfig(project={"paper_faithful": False})
+    cfg, _ = apply_recommendation_to_config(cfg, qwen_architecture(), preset="slimqwen_anchor", candidate_id="slimqwen_anchor_1")
+    changed_arch = {**qwen_architecture(), "hidden_size": 4096}
+
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        validate_applied_plan(cfg, changed_arch)
+
+    cfg.compression.target.hidden_size = 1792
+    with pytest.raises(ValueError, match="does not match compression.plan target"):
+        validate_applied_plan(cfg, qwen_architecture())

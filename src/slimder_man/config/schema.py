@@ -62,6 +62,14 @@ class CompressionTarget(StrictBaseModel):
     shared_experts: Literal["keep", "prune"] = "keep"
 
 
+class CompressionPlanConfig(StrictBaseModel):
+    candidate_id: str
+    preset: str
+    source_architecture_fingerprint: str
+    source_summary: dict[str, object] = Field(default_factory=dict)
+    target: CompressionTarget
+
+
 class DepthConfig(StrictBaseModel):
     method: Literal["last_layers", "activation_similarity"] = "last_layers"
 
@@ -74,7 +82,7 @@ class WidthConfig(StrictBaseModel):
 class ExpertsConfig(StrictBaseModel):
     method: Literal["partial_preservation_merge", "prune"] = "partial_preservation_merge"
     importance_metric: Literal["frequency", "soft_logits", "reap"] = "soft_logits"
-    similarity_metric: Literal["router_logits", "router_weights", "expert_outputs"] = "router_weights"
+    similarity_metric: Literal["router_logits", "router_weights"] = "router_weights"
     base_selection: Literal["next_highest_importance", "diverse_kcenter"] = "next_highest_importance"
     router_row_strategy: Literal["base", "weighted_average", "reinit_then_train"] = "base"
     keep_shared_experts: bool = True
@@ -83,6 +91,7 @@ class ExpertsConfig(StrictBaseModel):
 class CompressionConfig(StrictBaseModel):
     preset: str = "balanced_50"
     target: CompressionTarget = Field(default_factory=CompressionTarget)
+    plan: CompressionPlanConfig | None = None
     depth: DepthConfig = Field(default_factory=DepthConfig)
     width: WidthConfig = Field(default_factory=WidthConfig)
     experts: ExpertsConfig = Field(default_factory=ExpertsConfig)
@@ -168,11 +177,18 @@ class QuantProtectConfig(StrictBaseModel):
 
 class QuantizationConfig(StrictBaseModel):
     enabled: bool = False
-    mode: Literal["augmented_saliency_mixed_precision", "none"] = "augmented_saliency_mixed_precision"
+    mode: Literal["fake_quant_export", "augmented_saliency_mixed_precision", "none"] = "fake_quant_export"
     apply_stage: Literal["post_distill", "during_training"] = "post_distill"
     target_avg_bits: float | None = None
     prune_shared_experts: bool = False
     protect: QuantProtectConfig = Field(default_factory=QuantProtectConfig)
+
+    @field_validator("mode")
+    @classmethod
+    def normalize_legacy_mode(cls, value: str) -> str:
+        if value == "augmented_saliency_mixed_precision":
+            return "fake_quant_export"
+        return value
 
 
 class PerplexityConfig(StrictBaseModel):

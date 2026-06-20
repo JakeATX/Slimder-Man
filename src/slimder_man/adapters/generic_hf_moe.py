@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -22,16 +23,35 @@ def _first_int(obj: object | None, names: tuple[str, ...], default: int = 0) -> 
     return default
 
 
-def _expert_container(moe: nn.Module) -> nn.ModuleList | nn.ModuleDict | None:
+@dataclass(frozen=True)
+class ExpertContainerHandle:
+    owner: nn.Module
+    attr: str
+    container: nn.ModuleList | nn.ModuleDict
+
+
+@dataclass(frozen=True)
+class RouterHandle:
+    owner: nn.Module
+    attr: str
+    router: nn.Linear
+
+
+def _expert_container_handle(moe: nn.Module) -> ExpertContainerHandle | None:
     experts = getattr(moe, "experts", None)
     if isinstance(experts, (nn.ModuleList, nn.ModuleDict)):
-        return experts
+        return ExpertContainerHandle(moe, "experts", experts)
     for attr in ("mlp", "moe"):
         nested = getattr(moe, attr, None)
         experts = getattr(nested, "experts", None)
-        if isinstance(experts, (nn.ModuleList, nn.ModuleDict)):
-            return experts
+        if isinstance(nested, nn.Module) and isinstance(experts, (nn.ModuleList, nn.ModuleDict)):
+            return ExpertContainerHandle(nested, "experts", experts)
     return None
+
+
+def _expert_container(moe: nn.Module) -> nn.ModuleList | nn.ModuleDict | None:
+    handle = _expert_container_handle(moe)
+    return handle.container if handle is not None else None
 
 
 def _module_list(value: nn.ModuleList | nn.ModuleDict | nn.Module | None) -> list[nn.Module]:
@@ -44,15 +64,31 @@ def _module_list(value: nn.ModuleList | nn.ModuleDict | nn.Module | None) -> lis
     return []
 
 
-def _find_router(moe: nn.Module) -> nn.Linear | None:
+def _router_handle(moe: nn.Module) -> RouterHandle | None:
     for attr in ("router", "gate", "gate_proj"):
         value = getattr(moe, attr, None)
         if isinstance(value, nn.Linear):
-            return value
+            return RouterHandle(moe, attr, value)
     for name, module in moe.named_children():
         if name.lower() in {"router", "gate", "gate_proj"} and isinstance(module, nn.Linear):
-            return module
+            return RouterHandle(moe, name, module)
+    for container_attr in ("mlp", "moe"):
+        nested = getattr(moe, container_attr, None)
+        if not isinstance(nested, nn.Module):
+            continue
+        for attr in ("router", "gate", "gate_proj"):
+            value = getattr(nested, attr, None)
+            if isinstance(value, nn.Linear):
+                return RouterHandle(nested, attr, value)
+        for name, module in nested.named_children():
+            if name.lower() in {"router", "gate", "gate_proj"} and isinstance(module, nn.Linear):
+                return RouterHandle(nested, name, module)
     return None
+
+
+def _find_router(moe: nn.Module) -> nn.Linear | None:
+    handle = _router_handle(moe)
+    return handle.router if handle is not None else None
 
 
 def _slice_linear(module: nn.Linear, keep_idx: torch.Tensor, *, slice_in: bool, slice_out: bool) -> None:
@@ -96,6 +132,10 @@ def _linear_slice_rule(name: str, module: nn.Linear, hidden: int, *, is_router: 
         return module.in_features == hidden, False
     if leaf in {"o_proj", "out_proj"} and is_attention:
         return False, module.out_features == hidden
+    if leaf in {"in_proj_qkvz", "in_proj_ba"}:
+        return module.in_features == hidden, False
+    if leaf == "shared_expert_gate":
+        return module.in_features == hidden, False
     if leaf in {"up_proj", "w1", "w3"} and is_expert_context and module.out_features != hidden:
         return module.in_features == hidden, False
     if leaf == "gate_proj" and is_expert_context and module.out_features != hidden:
@@ -188,7 +228,11 @@ def structural_moe_layers(model: nn.Module) -> list[nn.Module]:
         if is_structural_moe_layer(module):
             out.append(module)
             seen.add(id(module))
-    return out
+    return [
+        module
+        for module in out
+        if not any(other is not module and any(child is other for child in module.modules()) for other in out)
+    ]
 
 
 class GenericHfMoeAdapter:
@@ -308,18 +352,26 @@ class GenericHfMoeAdapter:
         raise ValueError("Unable to locate transformer block list")
 
     def replace_experts(self, moe: nn.Module, new_experts: list[nn.Module], router_rows: torch.Tensor, new_top_k: int) -> None:
-        current = _expert_container(moe)
+        handle = _expert_container_handle(moe)
+        current = handle.container if handle is not None else None
         if isinstance(current, nn.ModuleDict):
-            moe.experts = nn.ModuleDict({str(i): expert for i, expert in enumerate(new_experts)})
+            replacement = nn.ModuleDict({str(i): expert for i, expert in enumerate(new_experts)})
         else:
-            moe.experts = nn.ModuleList(new_experts)
+            replacement = nn.ModuleList(new_experts)
+        if handle is not None:
+            setattr(handle.owner, handle.attr, replacement)
+        else:
+            moe.experts = replacement
         router = self.get_router(moe)
         new_router = nn.Linear(router_rows.shape[1], router_rows.shape[0], bias=router.bias is not None)
         with torch.no_grad():
             new_router.weight.copy_(router_rows.to(new_router.weight.dtype))
             if new_router.bias is not None:
                 new_router.bias.zero_()
-        if hasattr(moe, "router"):
+        handle = _router_handle(moe)
+        if handle is not None:
+            setattr(handle.owner, handle.attr, new_router)
+        elif hasattr(moe, "router"):
             moe.router = new_router
         elif hasattr(moe, "gate"):
             moe.gate = new_router

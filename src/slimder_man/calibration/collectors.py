@@ -26,7 +26,7 @@ class CalibrationResult:
     expert_similarity: list[torch.Tensor]
     router_logits_similarity: list[torch.Tensor] | None = None
     router_weights_similarity: list[torch.Tensor] | None = None
-    expert_outputs_similarity: list[torch.Tensor] | None = None
+    expert_layer_indices: list[int] | None = None
     representation: str = "post_softmax_topk_weights"
 
 
@@ -90,7 +90,7 @@ def collect_tiny_calibration(model: TinyMoEForCausalLM, batches: list[torch.Tens
         expert_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
         router_logits_similarity=[streaming_cosine(chunks) for chunks in logit_chunks],
         router_weights_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
-        expert_outputs_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
+        expert_layer_indices=list(range(len(model.layers))),
     )
 
 
@@ -113,6 +113,7 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
         return collect_tiny_calibration(model, batches)
     adapter = adapter or get_adapter(model)
     architecture = adapter.describe_architecture(model)
+    expert_layer_indices = [int(info.layer_idx) for info in architecture.moe_layers]
     hidden_size = architecture.hidden_size
     norms = adapter.iter_rmsnorms(model)
     moes = adapter.iter_moe_layers(model)
@@ -194,7 +195,7 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
         expert_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
         router_logits_similarity=[streaming_cosine(chunks) for chunks in logit_chunks],
         router_weights_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
-        expert_outputs_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
+        expert_layer_indices=expert_layer_indices,
         representation="router_hook_recomputed_expert_outputs" if used_hook_fallback else "post_softmax_topk_weights",
     )
 

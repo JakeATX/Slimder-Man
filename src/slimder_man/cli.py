@@ -14,6 +14,7 @@ from slimder_man.adapters.registry import get_adapter
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.analyze.architecture import describe_model
 from slimder_man.analyze.config_only import describe_config_architecture
+from slimder_man.analyze.plans import architecture_fingerprint, apply_recommendation_to_config, validate_applied_plan
 from slimder_man.analyze.recommender import recommend
 from slimder_man.analyze.reports import write_analysis_report
 from slimder_man.calibration.artifacts import write_calibration_artifacts
@@ -152,6 +153,26 @@ def _load_model(cfg: SlimderConfig):
 
 def _load_tokenizer(cfg: SlimderConfig):
     return None if cfg.teacher.load_mode == "tiny" else _load_transformers_tokenizer(cfg)
+
+
+def _recommendation_architecture(cfg: SlimderConfig, config_only: bool = False) -> dict:
+    if config_only:
+        if cfg.teacher.load_mode != "transformers":
+            raise typer.BadParameter("--config-only is only valid for teacher.load_mode=transformers")
+        return describe_config_architecture(_load_transformers_config(cfg))
+    return describe_model(_load_model(cfg))
+
+
+def _requires_applied_plan(cfg: SlimderConfig) -> bool:
+    return cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe"
+
+
+def _reject_missing_required_plan(cfg: SlimderConfig) -> None:
+    if _requires_applied_plan(cfg) and cfg.compression.plan is None:
+        raise typer.BadParameter(
+            "compression.plan is required before compressing arbitrary Transformers checkpoints. "
+            "Run slimder recommend --candidate-id <id> --write-config <path> first."
+        )
 
 
 def _checkpoint_kind(checkpoint: Path) -> str:
@@ -398,12 +419,35 @@ def analyze(config: Path, config_only: bool = typer.Option(False, "--config-only
 
 
 @app.command(name="recommend")
-def recommend_cmd(config: Path = typer.Option(..., "--config"), preset: str = "balanced_50", json_output: bool = typer.Option(False, "--json")) -> None:
+def recommend_cmd(
+    config: Path = typer.Option(..., "--config"),
+    preset: str = "balanced_50",
+    candidate_id: str | None = typer.Option(None, "--candidate-id"),
+    write_config: Path | None = typer.Option(None, "--write-config"),
+    config_only: bool = typer.Option(False, "--config-only"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
     cfg = _load_cli_config(config)
     set_seed(cfg.project.seed)
-    model = _load_model(cfg)
-    recs = recommend(describe_model(model), preset)
-    _echo({"preset": preset, "candidates": recs}, json_output)
+    arch = _recommendation_architecture(cfg, config_only=config_only)
+    recs = recommend(arch, preset)
+    plan = None
+    written_config = None
+    if candidate_id is not None or write_config is not None:
+        cfg, plan = apply_recommendation_to_config(cfg, arch, preset=preset, candidate_id=candidate_id)
+        if write_config is not None:
+            save_config(cfg, write_config)
+            written_config = str(write_config)
+    _echo(
+        {
+            "preset": preset,
+            "architecture_fingerprint": architecture_fingerprint(arch),
+            "candidates": recs,
+            "selected_plan": plan,
+            "written_config": written_config,
+        },
+        json_output,
+    )
 
 @app.command()
 def compress(
@@ -415,9 +459,11 @@ def compress(
     config_path = _resolve_config_path(config, config_option)
     cfg = _load_cli_config(config_path)
     set_seed(cfg.project.seed)
+    _reject_missing_required_plan(cfg)
     out_dir = Path(cfg.project.output_dir) / "checkpoints" / f"stage_{stage}_compressed"
     teacher = _load_model(cfg)
     arch = describe_model(teacher)
+    validate_applied_plan(cfg, arch, required=_requires_applied_plan(cfg))
     tokenizer = _load_tokenizer(cfg)
     batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
     analysis_dir = Path(cfg.project.output_dir) / "analysis"
@@ -492,8 +538,10 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
                 "Full local run for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true. "
                 "Use --dry-run, explicit staged analyze/compress/distill commands, or remote launch for large checkpoints."
             )
+        _reject_missing_required_plan(cfg)
         teacher = _load_model(cfg)
         arch = describe_model(teacher)
+        validate_applied_plan(cfg, arch, required=_requires_applied_plan(cfg))
         tokenizer = _load_tokenizer(cfg)
         batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
         adapter = get_adapter(teacher)
@@ -516,6 +564,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
             calibration_manifest_path=analysis_dir / "calibration_manifest.json",
             source_config_path=config,
         )
+        teacher = _load_model(cfg)
         train = train_causal_lm_distill(teacher, student, cfg, out_dir / "training", batches, resume=False)
         eval_batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch["vocab_size"], tokenizer=tokenizer)
         ppl = causal_lm_perplexity(student, eval_batches[:8])
@@ -533,6 +582,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
         return
     teacher = _tiny_teacher(cfg)
     arch = describe_model(teacher)
+    validate_applied_plan(cfg, arch, required=False)
     batches, cal_manifest = sample_calibration_tokens(cfg.calibration, vocab_size=teacher.config.vocab_size)
     cal = collect_tiny_calibration(teacher, batches)
     out_dir = Path(cfg.project.output_dir)
@@ -603,6 +653,8 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
     manifest = {
         "mode": cfg.quantization.mode,
         "backend": fake_manifest["backend"],
+        "production_ready": False,
+        "export_format": fake_manifest["export_format"],
         "checkpoint_kind": kind,
         "source_checkpoint": str(checkpoint),
         "target_avg_bits": target_bits,
@@ -613,6 +665,7 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
         "export_manifest": "quant_export_manifest.json",
         "artifact_hashes": {},
         "note": fake_manifest["note"],
+        "warning": "This command currently writes dequantized fake-quant tensors for smoke/export tests, not a packed production quantized MoE checkpoint.",
     }
     manifest["artifact_hashes"] = {
         name: sha256_file(out_dir / name)
@@ -625,6 +678,7 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
         manifest["backend"],
         fake_manifest,
         source_checkpoint=str(checkpoint),
+        export_format=manifest["export_format"],
     )
     _echo({"checkpoint": str(checkpoint), "out": str(out_dir), "manifest": manifest}, json_output)
 

@@ -57,7 +57,6 @@ def test_calibration_artifact_writer_persists_tensors_and_provenance(tmp_path: P
             {
                 f"expert_similarity_layer_{idx}_router_logits.safetensors",
                 f"expert_similarity_layer_{idx}_router_weights.safetensors",
-                f"expert_similarity_layer_{idx}_expert_outputs.safetensors",
             }
         )
     assert expected_files.issubset({path.name for path in out_dir.iterdir()})
@@ -135,7 +134,7 @@ def test_non_tiny_analyze_writes_calibration_artifacts(monkeypatch, tmp_path: Pa
 
     text_path = tmp_path / "calibration.txt"
     text_path.write_text("alpha beta gamma delta epsilon zeta", encoding="utf-8")
-    cfg = _text_cfg(text_path, tmp_path / "runs", similarity_metric="expert_outputs")
+    cfg = _text_cfg(text_path, tmp_path / "runs", similarity_metric="router_logits")
     config_path = tmp_path / "config.yaml"
     save_config(cfg, config_path)
 
@@ -149,9 +148,9 @@ def test_non_tiny_analyze_writes_calibration_artifacts(monkeypatch, tmp_path: Pa
     manifest = json.loads((analysis_dir / "calibration_manifest.json").read_text(encoding="utf-8"))
     routing = json.loads((analysis_dir / "routing_summary.json").read_text(encoding="utf-8"))
     assert manifest["teacher_load_mode"] == "transformers"
-    assert manifest["experts"]["similarity_metric"] == "expert_outputs"
+    assert manifest["experts"]["similarity_metric"] == "router_logits"
     assert manifest["calibration"]["tokenizer"] == "DummyTokenizer"
-    assert routing["similarity_metric"] == "expert_outputs"
+    assert routing["similarity_metric"] == "router_logits"
     assert routing["reap_convention"] == "assigned_token_mean_gate_weighted_output_norm2"
     assert (analysis_dir / "hidden_importance.safetensors").exists()
-    assert (analysis_dir / "expert_similarity_layer_0_expert_outputs.safetensors").exists()
+    assert (analysis_dir / "expert_similarity_layer_0_router_logits.safetensors").exists()

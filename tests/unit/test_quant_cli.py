@@ -29,6 +29,9 @@ def test_quantize_cli_uses_fake_backend_and_writes_manifests(tmp_path: Path):
     manifest = payload["manifest"]
     out_dir = tmp_path / "run" / "quantized"
     assert manifest["backend"] == "fake_symmetric_uniform"
+    assert manifest["production_ready"] is False
+    assert manifest["export_format"] == "dequantized_fake_quant"
+    assert "not a packed production" in manifest["warning"]
     assert manifest["target_avg_bits"] == 10.0
     assert "embed_tokens.weight" in manifest["allocation"]
     assert manifest["validation"]["finite_loss"] is True
@@ -42,6 +45,7 @@ def test_quantize_cli_uses_fake_backend_and_writes_manifests(tmp_path: Path):
     assert (out_dir / "fake_quant_manifest.json").exists()
     assert (out_dir / "quantization_manifest.json").exists()
     export_manifest = read_json(out_dir / "quant_export_manifest.json")
+    assert export_manifest["export_format"] == "dequantized_fake_quant"
     assert export_manifest["source_checkpoint"] == str(checkpoint)
     assert export_manifest["artifact_hashes"] == collect_export_hashes(out_dir)
     assert "quantization_manifest.json" in export_manifest["artifact_hashes"]
@@ -70,6 +74,7 @@ def test_quantize_cli_supports_hf_dummy_fake_backend(tmp_path: Path):
     out_dir = tmp_path / "run" / "quantized"
     assert manifest["checkpoint_kind"] == "dummy_hf_moe"
     assert manifest["backend"] == "fake_symmetric_uniform"
+    assert manifest["production_ready"] is False
     assert manifest["validation"]["finite_loss"] is True
     assert "model.layers.0.mlp.gate.weight" in manifest["allocation"]
     assert manifest["allocation"]["model.layers.0.mlp.gate.weight"] == 16

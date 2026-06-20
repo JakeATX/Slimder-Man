@@ -130,6 +130,61 @@ def test_config_only_analyze_rejects_tiny_mode(tmp_path: Path):
     assert "Usage:" in result.output
 
 
+def test_recommend_config_only_writes_applied_qwen_anchor_config(monkeypatch, tmp_path: Path):
+    from slimder_man import cli
+
+    class FakeQwen3NextConfig:
+        model_type = "qwen3_next"
+        hidden_size = 2048
+        vocab_size = 151936
+        num_hidden_layers = 48
+        num_experts = 512
+        shared_expert_intermediate_size = 512
+        num_experts_per_tok = 10
+        layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        tie_word_embeddings = False
+
+    monkeypatch.setattr(cli, "_load_transformers_config", lambda _cfg: FakeQwen3NextConfig())
+    monkeypatch.setattr(cli, "_load_model", lambda _cfg: (_ for _ in ()).throw(AssertionError("recommend --config-only loaded weights")))
+    cfg = SlimderConfig(
+        project={"output_dir": str(tmp_path / "out")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "Qwen/Qwen3-Next-80B-A3B-Instruct"},
+    )
+    config_path = tmp_path / "qwen.yaml"
+    applied_path = tmp_path / "qwen.applied.yaml"
+    config_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "recommend",
+            "--config",
+            str(config_path),
+            "--preset",
+            "slimqwen_anchor",
+            "--candidate-id",
+            "slimqwen_anchor_1",
+            "--write-config",
+            str(applied_path),
+            "--config-only",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    applied = SlimderConfig.model_validate(yaml.safe_load(applied_path.read_text(encoding="utf-8")))
+    assert payload["written_config"] == str(applied_path)
+    assert payload["selected_plan"]["target"]["hidden_size"] == 1536
+    assert applied.compression.target.hidden_size == 1536
+    assert applied.compression.target.remove_last_n_layers == 12
+    assert applied.compression.target.routed_experts == 256
+    assert applied.compression.target.routed_top_k == 8
+    assert applied.compression.plan is not None
+    assert applied.compression.plan.candidate_id == "slimqwen_anchor_1"
+    assert applied.compression.plan.source_architecture_fingerprint == payload["selected_plan"]["source_architecture_fingerprint"]
+
+
 def test_config_only_architecture_repeats_short_block_patterns():
     class FakeConfig:
         model_type = "qwen3_next"
@@ -318,6 +373,32 @@ def test_run_rejects_non_dummy_transformers_without_explicit_local_opt_in(monkey
     assert loaded is False
 
 
+def test_compress_rejects_arbitrary_transformers_without_applied_plan_before_loading(monkeypatch, tmp_path: Path):
+    from slimder_man import cli
+
+    loaded = False
+
+    def fail_if_loaded(_cfg):
+        nonlocal loaded
+        loaded = True
+        raise AssertionError("compress should reject missing compression.plan before loading weights")
+
+    monkeypatch.setattr(cli, "_load_model", fail_if_loaded)
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/real-qwen"},
+        compression={"target": {"hidden_size": 12, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
+    )
+    config_path = tmp_path / "real.yaml"
+    config_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["compress", "--config", str(config_path), "--json"])
+
+    assert result.exit_code != 0
+    assert "compression.plan is required" in result.output
+    assert loaded is False
+
+
 def test_run_accepts_opted_in_non_dummy_transformers_through_generic_hf_pipeline(monkeypatch, tmp_path: Path):
     from slimder_man import cli
 
@@ -330,6 +411,10 @@ def test_run_accepts_opted_in_non_dummy_transformers_through_generic_hf_pipeline
         training={"train_steps": 1, "micro_batch_size": 1, "global_batch_size": 1},
         compression={"target": {"hidden_size": 12, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
     )
+    from slimder_man.analyze.plans import apply_recommendation_to_config
+    from slimder_man.analyze.architecture import describe_model
+
+    cfg, _ = apply_recommendation_to_config(cfg, describe_model(DummyHfMoeForCausalLM()), preset="balanced_50")
     config_path = tmp_path / "full.yaml"
     config_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
 

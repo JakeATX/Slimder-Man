@@ -61,6 +61,34 @@ def test_worker_job_api_executes_local_subprocess_and_persists_state(tmp_path: P
     assert persisted["log_path"] == finished["log_path"]
 
 
+def test_worker_job_preserves_cuda_visible_devices(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    client = TestClient(create_worker_app(job_root=tmp_path / "worker"))
+
+    created = client.post(
+        "/v1/jobs",
+        json={
+            "command": sys.executable,
+            "args": ["-c", "import os; print(os.environ.get('CUDA_VISIBLE_DEVICES'))"],
+        },
+    ).json()
+
+    finished = _wait_for_terminal(client, created["id"])
+    logs = client.get(f"/v1/jobs/{created['id']}/logs").json()["logs"]
+
+    assert finished["runtime"]["cuda_visible_devices"] == "0,1"
+    assert "0,1" in logs
+
+
+def test_worker_preflight_reports_visible_devices(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
+    client = TestClient(create_worker_app(job_root=tmp_path / "worker"))
+
+    preflight = client.post("/v1/preflight").json()
+
+    assert preflight["cuda_visible_devices"] == "2"
+
+
 def test_worker_job_api_lists_and_zips_artifacts(tmp_path: Path):
     job_root = tmp_path / "worker"
     artifact_dir = tmp_path / "artifacts"

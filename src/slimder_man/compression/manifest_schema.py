@@ -96,6 +96,8 @@ class CompressionManifest(StrictModel):
     seed: int
     provenance: ManifestProvenance | None = None
     calibration_artifacts: ManifestCalibrationArtifacts | None = None
+    compression_plan: dict | None = None
+    memory: dict | None = None
     progressive: dict = Field(default_factory=dict)
     stage_provenance: dict = Field(default_factory=dict)
     calibration: dict

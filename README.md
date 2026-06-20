@@ -50,8 +50,12 @@ slimder compress src/slimder_man/config/examples/hf_dummy.yaml --stage 1 --json
 slimder distill src/slimder_man/config/examples/hf_dummy.yaml --stage 1 --json
 slimder eval --checkpoint runs/hf_dummy_moe_smoke/training/final --json
 slimder validate-checkpoint --checkpoint runs/hf_dummy_moe_smoke/checkpoints/stage_1_compressed --json
-slimder quantize --config src/slimder_man/config/examples/hf_dummy.yaml --checkpoint runs/hf_dummy_moe_smoke/checkpoints/stage_1_compressed --json
+slimder quantize src/slimder_man/config/examples/hf_dummy.yaml runs/hf_dummy_moe_smoke/checkpoints/stage_1_compressed --json
 ```
+
+The v0.1 quantize command is an augmented fake-quant/export smoke path: it
+writes dequantized tensors plus manifests, not packed production quantized MoE
+kernels.
 
 Remote launch planning:
 
@@ -79,5 +83,6 @@ require `--auth-token` or `SLIMDER_WORKER_TOKEN` because `/v1/jobs` executes
 local subprocesses. Treat the worker API as trusted infrastructure; artifact
 sync packages the job's recorded artifact paths for retrieval.
 
-The package targets Python `>=3.11,<3.13`.
+The package targets Python `>=3.11,<3.13` and supports Transformers
+`>=4.55,<6`, including the packed/fused Transformers 5.x Qwen MoE layout.
 GitHub Actions runs unit and non-GPU smoke tests on Python 3.11 and 3.12.

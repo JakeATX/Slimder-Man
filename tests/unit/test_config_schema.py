@@ -39,6 +39,11 @@ def test_augmented_config_accepts_saliency_quantization():
     assert cfg.quantization.enabled
 
 
+def test_expert_outputs_similarity_is_rejected_until_real_output_sketches_exist():
+    with pytest.raises(ValidationError, match="similarity_metric"):
+        SlimderConfig(project={"paper_faithful": False}, compression={"experts": {"similarity_metric": "expert_outputs"}})
+
+
 def test_augmented_config_accepts_topk_logit_cache_path():
     cfg = SlimderConfig(
         project={"paper_faithful": False},

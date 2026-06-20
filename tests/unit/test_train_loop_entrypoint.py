@@ -124,7 +124,7 @@ def test_accelerate_launch_train_loop_tiny_cpu(tmp_path: Path):
         capture_output=True,
         env=env,
     )
-    if proc.returncode != 0 and "No module named accelerate" in proc.stderr:
+    if proc.returncode != 0 and "No module named" in proc.stderr and "accelerate" in proc.stderr:
         pytest.skip("accelerate is not installed")
 
     assert proc.returncode == 0, proc.stderr

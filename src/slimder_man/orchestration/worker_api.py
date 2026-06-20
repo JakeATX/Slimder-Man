@@ -55,7 +55,12 @@ def create_worker_app(
         import shutil
         import torch
 
-        return {"python": True, "cuda_available": torch.cuda.is_available(), "nvidia_smi": shutil.which("nvidia-smi") is not None}
+        return {
+            "python": True,
+            "cuda_available": torch.cuda.is_available(),
+            "nvidia_smi": shutil.which("nvidia-smi") is not None,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        }
 
     @app.post("/v1/jobs")
     def create_job(req: JobRequest):
