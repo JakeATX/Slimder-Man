@@ -46,7 +46,7 @@ def build_config_yaml(
     cfg.project.name = project_name
     cfg.project.output_dir = output_dir or f"runs/{project_name}"
     cfg.project.paper_faithful = paper_faithful
-    cfg.quantization.enabled = quantization
+    cfg.quantization.enabled = bool(quantization) and not paper_faithful
     cfg.teacher.model_id_or_path = teacher_model_id_or_path
     cfg.teacher.load_mode = teacher_load_mode
     cfg.teacher.dtype = teacher_dtype
@@ -181,6 +181,12 @@ def config_warnings(yaml_text: str) -> str:
     if cfg.teacher.load_mode == "transformers" and cfg.runtime.backend == "local" and not cfg.runtime.local.allow_full_model_run:
         warnings.append("Arbitrary Transformers local run requires runtime.local.allow_full_model_run=true; use launch/dry-run for large checkpoints.")
     return "\n".join(warnings) if warnings else "No warnings."
+
+
+def paper_faithful_quant_state(paper_faithful: bool) -> dict:
+    if paper_faithful:
+        return {"value": False, "interactive": False}
+    return {"interactive": True}
 
 
 def create_app(test_mode: bool = False):
@@ -366,6 +372,7 @@ def create_app(test_mode: bool = False):
             output_dir,
         ]
         btn.click(_build_from_ui, inputs=[*config_inputs, preset], outputs=[output]).then(config_warnings, inputs=[output], outputs=[warnings_out])
+        faithful.change(lambda value: gr.update(**paper_faithful_quant_state(value)), inputs=[faithful], outputs=[quant])
         for value, button in [
             ("conservative_20", conservative_btn),
             ("balanced_50", balanced_btn),

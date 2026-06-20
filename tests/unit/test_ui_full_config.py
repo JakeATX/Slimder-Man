@@ -2,7 +2,7 @@ import json
 import yaml
 
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.ui.app import artifact_index, build_config_yaml, config_warnings, log_tail, run_cli_with_yaml, run_ui_command
+from slimder_man.ui.app import artifact_index, build_config_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command
 
 
 def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
@@ -64,6 +64,18 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
     assert cfg.runtime.skypilot.accelerators == "A100:4"
     assert cfg.runtime.skypilot.cloud == "aws"
     assert cfg.runtime.tracking.backend == "none"
+
+
+def test_ui_paper_faithful_forces_augmented_quantization_off():
+    faithful = SlimderConfig.model_validate(yaml.safe_load(build_config_yaml(paper_faithful=True, quantization=True)))
+    augmented = SlimderConfig.model_validate(yaml.safe_load(build_config_yaml(paper_faithful=False, quantization=True)))
+
+    assert faithful.project.paper_faithful is True
+    assert faithful.quantization.enabled is False
+    assert augmented.project.paper_faithful is False
+    assert augmented.quantization.enabled is True
+    assert paper_faithful_quant_state(True) == {"value": False, "interactive": False}
+    assert paper_faithful_quant_state(False) == {"interactive": True}
 
 
 def test_ui_helpers_run_tiny_analyze_recommend_and_run(tmp_path):
