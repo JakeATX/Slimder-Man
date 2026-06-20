@@ -16,7 +16,8 @@ This v0.1 implementation provides:
   MoE detection, sparse layer indices, depth pruning, width slicing, expert
   pruning/merge, router transforms, and finite forward validation;
 - local, SSH, SkyPilot, and worker-runner surfaces with dry-run plans, executable
-  runner APIs, log streaming, stop/sync operations, and secret redaction.
+  runner APIs, worker submit/status/log/stop controls, SSH/SkyPilot sync
+  operations, and secret redaction.
 
 Real Qwen3-Next-80B work remains hardware-gated: local full-model execution
 requires explicit `runtime.local.allow_full_model_run=true`, and default CI uses
@@ -61,6 +62,10 @@ slimder launch src/slimder_man/config/examples/hf_dummy.yaml --backend skypilot 
 slimder launch path/to/worker_config.yaml --backend worker --json
 slimder worker --json
 slimder worker --host 0.0.0.0 --auth-token change-me
+slimder worker-preflight --config path/to/worker_config.yaml --json
+slimder worker-status --config path/to/worker_config.yaml --job-id JOB_ID --json
+slimder worker-logs --config path/to/worker_config.yaml --job-id JOB_ID --json
+slimder worker-stop --config path/to/worker_config.yaml --job-id JOB_ID --json
 ```
 
 For SSH/SkyPilot configs, `runtime.ssh.dry_run=false` or

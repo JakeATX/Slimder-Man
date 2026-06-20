@@ -677,6 +677,31 @@ def worker(
     uvicorn.run(create_worker_app(teacher_model, auth_token=auth_token), host=host, port=port)
 
 
+def _worker_runner_from_config(config: Path) -> WorkerAPIRunner:
+    cfg = _load_cli_config(config)
+    return WorkerAPIRunner(config, cfg)
+
+
+@app.command("worker-preflight")
+def worker_preflight(config: Path = typer.Option(..., "--config"), json_output: bool = typer.Option(False, "--json")) -> None:
+    _echo({"backend": "worker", "preflight": _worker_runner_from_config(config).preflight()}, json_output)
+
+
+@app.command("worker-status")
+def worker_status(config: Path = typer.Option(..., "--config"), job_id: str = typer.Option(..., "--job-id"), json_output: bool = typer.Option(False, "--json")) -> None:
+    _echo({"backend": "worker", "job": _worker_runner_from_config(config).status(job_id)}, json_output)
+
+
+@app.command("worker-logs")
+def worker_logs(config: Path = typer.Option(..., "--config"), job_id: str = typer.Option(..., "--job-id"), json_output: bool = typer.Option(False, "--json")) -> None:
+    _echo({"backend": "worker", "logs": _worker_runner_from_config(config).logs(job_id)}, json_output)
+
+
+@app.command("worker-stop")
+def worker_stop(config: Path = typer.Option(..., "--config"), job_id: str = typer.Option(..., "--job-id"), json_output: bool = typer.Option(False, "--json")) -> None:
+    _echo({"backend": "worker", "job": _worker_runner_from_config(config).stop(job_id)}, json_output)
+
+
 @app.command("consolidate-checkpoint")
 def consolidate_checkpoint(
     checkpoint: Path | None = typer.Argument(None),

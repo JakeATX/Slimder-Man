@@ -269,6 +269,37 @@ def test_worker_api_runner_dry_run_summarizes_config_text(tmp_path: Path):
     assert result.request_payload["config_text_bytes"] > 0
 
 
+def test_worker_api_client_preflight_uses_auth_header(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"python": true}'
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["headers"] = dict(req.header_items())
+        captured["body"] = req.data
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("slimder_man.orchestration.worker_client.request.urlopen", fake_urlopen)
+
+    result = WorkerAPIClient("http://worker", auth_token="secret-token", timeout_seconds=3).preflight()
+
+    assert result == {"python": True}
+    assert captured["url"] == "http://worker/v1/preflight"
+    assert captured["headers"]["Authorization"] == "Bearer secret-token"
+    assert captured["body"] == b"{}"
+    assert captured["timeout"] == 3
+
+
 def test_cli_launch_worker_uses_worker_api_runner(monkeypatch, tmp_path: Path):
     config_path = tmp_path / "worker.yaml"
     cfg = SlimderConfig(
@@ -308,6 +339,56 @@ def test_cli_launch_worker_uses_worker_api_runner(monkeypatch, tmp_path: Path):
     assert captured["config"] == config_path
     assert captured["cfg"].runtime.worker.api_url == "http://worker.example"
     assert captured["dry_run"] is False
+
+
+def test_cli_worker_lifecycle_commands_use_worker_api_runner(monkeypatch, tmp_path: Path):
+    config_path = tmp_path / "worker.yaml"
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        runtime={"worker": {"api_url": "http://worker.example"}},
+    )
+    save_config(cfg, config_path)
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, config, cfg):
+            calls.append(("init", config, cfg.runtime.worker.api_url))
+
+        def preflight(self):
+            calls.append(("preflight",))
+            return {"python": True}
+
+        def status(self, job_id):
+            calls.append(("status", job_id))
+            return {"id": job_id, "status": "running"}
+
+        def logs(self, job_id):
+            calls.append(("logs", job_id))
+            return {"id": job_id, "logs": ["ok"]}
+
+        def stop(self, job_id):
+            calls.append(("stop", job_id))
+            return {"id": job_id, "status": "cancelled"}
+
+    monkeypatch.setattr("slimder_man.cli.WorkerAPIRunner", FakeRunner)
+    runner = CliRunner()
+
+    preflight = runner.invoke(app, ["worker-preflight", "--config", str(config_path), "--json"])
+    status = runner.invoke(app, ["worker-status", "--config", str(config_path), "--job-id", "job-1", "--json"])
+    logs = runner.invoke(app, ["worker-logs", "--config", str(config_path), "--job-id", "job-1", "--json"])
+    stop = runner.invoke(app, ["worker-stop", "--config", str(config_path), "--job-id", "job-1", "--json"])
+
+    assert preflight.exit_code == 0, preflight.output
+    assert status.exit_code == 0, status.output
+    assert logs.exit_code == 0, logs.output
+    assert stop.exit_code == 0, stop.output
+    assert json.loads(preflight.output)["preflight"] == {"python": True}
+    assert json.loads(status.output)["job"]["status"] == "running"
+    assert json.loads(logs.output)["logs"]["logs"] == ["ok"]
+    assert json.loads(stop.output)["job"]["status"] == "cancelled"
+    assert ("status", "job-1") in calls
+    assert ("logs", "job-1") in calls
+    assert ("stop", "job-1") in calls
 
 
 def test_worker_cli_json_reports_auth_requirement():

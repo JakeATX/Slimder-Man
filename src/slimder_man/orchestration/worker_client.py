@@ -39,6 +39,9 @@ class WorkerAPIClient:
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._json("POST", "/v1/jobs", payload)
 
+    def preflight(self) -> dict[str, Any]:
+        return self._json("POST", "/v1/preflight", {})
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self._json("GET", f"/v1/jobs/{job_id}", None)
 
@@ -94,6 +97,9 @@ class WorkerAPIRunner:
 
     def status(self, job_id: str) -> dict[str, Any]:
         return _redacted_payload(self.client.get_job(job_id))
+
+    def preflight(self) -> dict[str, Any]:
+        return _redacted_payload(self.client.preflight())
 
     def logs(self, job_id: str) -> dict[str, Any]:
         return _redacted_payload(self.client.logs(job_id))
