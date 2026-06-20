@@ -39,6 +39,15 @@ def test_augmented_config_accepts_saliency_quantization():
     assert cfg.quantization.enabled
 
 
+def test_augmented_config_accepts_topk_logit_cache_path():
+    cfg = SlimderConfig(
+        project={"paper_faithful": False},
+        kd={"teacher_mode": "offline_topk_logit_cache", "offline_topk_logits_cache_path": "topk_cache.pt"},
+    )
+    assert cfg.kd.teacher_mode == "offline_topk_logit_cache"
+    assert cfg.kd.offline_topk_logits_cache_path == "topk_cache.pt"
+
+
 def test_nested_unknown_fields_are_rejected():
     with pytest.raises(ValidationError):
         SlimderConfig(compression={"depth": {"methdo": "last_layers"}})

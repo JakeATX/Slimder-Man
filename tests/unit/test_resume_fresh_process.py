@@ -7,7 +7,13 @@ import torch
 
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.distill.offline_cache import OfflineFullLogitsCache, write_full_logits_cache
+from slimder_man.distill.offline_cache import (
+    OfflineFullLogitsCache,
+    OfflineTopKLogitsCache,
+    full_logits_cache_key,
+    write_full_logits_cache,
+    write_topk_logits_cache,
+)
 from slimder_man.distill.train_loop import train_causal_lm_distill
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -200,11 +206,11 @@ def test_generic_distill_rejects_unsupported_teacher_modes(tmp_path: Path):
     cfg = SlimderConfig(
         teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
         project={"paper_faithful": False, "output_dir": str(tmp_path)},
-        kd={"teacher_mode": "offline_topk_logit_cache"},
+        kd={"teacher_mode": "openai_api"},
     )
     batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
 
-    with pytest.raises(ValueError, match="offline_full_logits_cache"):
+    with pytest.raises(ValueError, match="remote_worker_full_logits"):
         train_causal_lm_distill(teacher, student, cfg, tmp_path / "unsupported", batches)
 
 
@@ -259,6 +265,64 @@ def test_offline_full_logits_cache_uses_restricted_torch_loader(monkeypatch, tmp
     assert captured["weights_only"] is True
 
 
+def test_offline_topk_logits_cache_uses_restricted_torch_loader(monkeypatch, tmp_path: Path):
+    cache_path = tmp_path / "topk_logits_cache.pt"
+    input_ids = torch.tensor([[1, 2, 3]])
+    logits = torch.zeros(1, 3, 5)
+    logits[..., 2] = 4.0
+    write_topk_logits_cache(cache_path, [(input_ids, logits)], top_k=2)
+    real_load = torch.load
+    captured = {}
+
+    def recording_load(*args, **kwargs):
+        captured["weights_only"] = kwargs.get("weights_only")
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr("slimder_man.distill.offline_cache.torch.load", recording_load)
+
+    out = OfflineTopKLogitsCache.from_path(cache_path).teacher_output(input_ids)
+
+    assert captured["weights_only"] is True
+    assert out.logits.shape == (1, 3, 5)
+    assert out.logits.argmax(dim=-1).tolist() == [[2, 2, 2]]
+
+
+def test_offline_topk_logits_cache_rejects_malformed_payloads(tmp_path: Path):
+    input_ids = torch.tensor([[1, 2, 3]])
+    base_entry = {
+        "key": full_logits_cache_key(input_ids),
+        "input_ids": input_ids,
+        "topk_indices": torch.zeros(1, 3, 1, dtype=torch.long),
+        "topk_values": torch.zeros(1, 3, 1),
+    }
+
+    cases = [
+        ({"format": "slimder_topk_logits_cache_v1", "vocab_size": 5, "fill_value": float("nan"), "entries": [base_entry]}, "fill_value"),
+        (
+            {
+                "format": "slimder_topk_logits_cache_v1",
+                "vocab_size": 5,
+                "entries": [{**base_entry, "topk_indices": torch.zeros(1, 3, 0, dtype=torch.long), "topk_values": torch.zeros(1, 3, 0)}],
+            },
+            "at least one top-k value",
+        ),
+        (
+            {
+                "format": "slimder_topk_logits_cache_v1",
+                "vocab_size": 5,
+                "entries": [{**base_entry, "topk_values": torch.full((1, 3, 1), float("inf"))}],
+            },
+            "non-finite values",
+        ),
+        ({"format": "slimder_topk_logits_cache_v1", "vocab_size": 5, "entries": [base_entry, base_entry]}, "duplicate entry"),
+    ]
+    for idx, (payload, message) in enumerate(cases):
+        path = tmp_path / f"bad_topk_{idx}.pt"
+        torch.save(payload, path)
+        with pytest.raises(ValueError, match=message):
+            OfflineTopKLogitsCache.from_path(path)
+
+
 def test_offline_full_logits_cache_requires_path(tmp_path: Path):
     teacher = DummyHfMoeForCausalLM()
     student = DummyHfMoeForCausalLM()
@@ -271,6 +335,52 @@ def test_offline_full_logits_cache_requires_path(tmp_path: Path):
 
     with pytest.raises(ValueError, match="offline_full_logits_cache_path"):
         train_causal_lm_distill(teacher, student, cfg, tmp_path / "offline_missing", batches)
+
+
+def test_offline_topk_logits_cache_requires_path(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = DummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        kd={"teacher_mode": "offline_topk_logit_cache"},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    with pytest.raises(ValueError, match="offline_topk_logits_cache_path"):
+        train_causal_lm_distill(teacher, student, cfg, tmp_path / "topk_missing", batches)
+
+
+def test_generic_distill_augmented_topk_cache_uses_approximate_logits_without_local_teacher(tmp_path: Path):
+    teacher = RaisingTeacher()
+    student = DummyHfMoeForCausalLM()
+    cfg_base = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "dummy-hf-moe"},
+        calibration={"sample_count": 2, "sequence_length": 8},
+        training={"train_steps": 1, "global_batch_size": 1, "micro_batch_size": 1, "warmup_steps": 0},
+    )
+    batches, _ = sample_calibration_tokens(cfg_base.calibration, vocab_size=student.config.vocab_size)
+    logits = batches[0].new_full((1, 8, student.config.vocab_size), -5.0).float()
+    logits[..., 3] = 5.0
+    cache_path = tmp_path / "topk_logits_cache.pt"
+    write_topk_logits_cache(cache_path, [(batches[0], logits)], top_k=4)
+    cfg = cfg_base.model_copy(
+        update={
+            "kd": cfg_base.kd.model_copy(
+                update={
+                    "teacher_mode": "offline_topk_logit_cache",
+                    "offline_topk_logits_cache_path": str(cache_path),
+                    "mtp": cfg_base.kd.mtp.model_copy(update={"enabled": False}),
+                }
+            )
+        }
+    )
+
+    result = train_causal_lm_distill(teacher, student, cfg, tmp_path / "topk_training", batches)
+
+    assert result["global_step"] == 1
+    assert result["logs"][0]["loss_kd"] > 0
 
 
 def test_generic_distill_remote_worker_logits_mode_uses_client_not_local_teacher(tmp_path: Path):

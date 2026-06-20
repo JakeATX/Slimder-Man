@@ -153,6 +153,7 @@ class KDConfig(StrictBaseModel):
         "openai_api",
     ] = "online_full_logits"
     offline_full_logits_cache_path: str | None = None
+    offline_topk_logits_cache_path: str | None = None
     temperature: float = 1.0
     lambda_schedule: ScheduleConfig = Field(default_factory=lambda: ScheduleConfig(type="linear", start=1.0, end=0.75))
     mtp: MTPConfig = Field(default_factory=MTPConfig)
