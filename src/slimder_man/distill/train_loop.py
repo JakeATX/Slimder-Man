@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from slimder_man.adapters.registry import get_adapter
 from slimder_man.adapters.tiny import TinyMoEForCausalLM
 from slimder_man.calibration.datasets import sample_calibration_tokens
 from slimder_man.config.schema import SlimderConfig, load_config
@@ -392,10 +393,23 @@ def run_train_loop_entrypoint(
         return {"entrypoint": "slimder_man.distill.train_loop", "mode": "tiny", **result}
 
     if cfg.teacher.model_id_or_path != "dummy-hf-moe":
-        raise ValueError(
-            "train_loop entrypoint currently supports teacher.load_mode=tiny or model_id_or_path=dummy-hf-moe. "
-            "Use `slimder compress` followed by `slimder distill`, remote launch, or a model-specific training config for real checkpoints."
-        )
+        if not cfg.runtime.local.allow_full_model_run:
+            raise ValueError(
+                "train_loop entrypoint for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true "
+                "to avoid accidental full-model downloads. Pass --checkpoint with a compressed student checkpoint and opt in explicitly."
+            )
+        init_checkpoint = Path(checkpoint) if checkpoint else None
+        if resume and (out_dir / "resume_model").exists():
+            init_checkpoint = out_dir / "resume_model"
+        if init_checkpoint is None:
+            raise ValueError("--checkpoint is required for arbitrary Transformers distillation entrypoint runs")
+        teacher = _load_entrypoint_transformers_model(cfg)
+        student = _load_entrypoint_transformers_checkpoint(cfg, init_checkpoint)
+        tokenizer = _load_entrypoint_transformers_tokenizer(cfg)
+        arch = get_adapter(student).describe_architecture(student)
+        batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=arch.vocab_size, tokenizer=tokenizer)
+        result = train_causal_lm_distill(teacher, student, cfg, out_dir, batches, resume=resume)
+        return {"entrypoint": "slimder_man.distill.train_loop", "mode": "transformers", "student_checkpoint": str(init_checkpoint), **result}
 
     from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM, DummyTokenizer
 
@@ -409,6 +423,55 @@ def run_train_loop_entrypoint(
     batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size, tokenizer=DummyTokenizer())
     result = train_causal_lm_distill(teacher, student, cfg, out_dir, batches, resume=resume)
     return {"entrypoint": "slimder_man.distill.train_loop", "mode": "dummy_hf_moe", **result}
+
+
+def _load_entrypoint_transformers_model(cfg: SlimderConfig):
+    from transformers import AutoModelForCausalLM
+
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    return AutoModelForCausalLM.from_pretrained(
+        cfg.teacher.model_id_or_path,
+        revision=cfg.teacher.revision,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+        torch_dtype=dtype_map.get(cfg.teacher.dtype, torch.float32),
+        device_map=cfg.teacher.device_map,
+    )
+
+
+def _load_entrypoint_transformers_checkpoint(cfg: SlimderConfig, checkpoint: str | Path):
+    from transformers import AutoModelForCausalLM
+
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    return AutoModelForCausalLM.from_pretrained(
+        checkpoint,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+        torch_dtype=dtype_map.get(cfg.teacher.dtype, torch.float32),
+        device_map=cfg.teacher.device_map,
+    )
+
+
+def _load_entrypoint_transformers_tokenizer(cfg: SlimderConfig):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        cfg.teacher.model_id_or_path,
+        revision=cfg.teacher.revision,
+        trust_remote_code=cfg.teacher.trust_remote_code,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:

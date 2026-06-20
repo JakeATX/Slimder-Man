@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from slimder_man.adapters.hf_dummy import DummyHfMoeForCausalLM, DummyTokenizer
 from slimder_man.config.schema import SlimderConfig, save_config
+from slimder_man.distill.train_loop import run_train_loop_entrypoint
 
 
 def _entrypoint_config(tmp_path: Path) -> Path:
@@ -69,7 +71,35 @@ def test_train_loop_rejects_arbitrary_transformers_entrypoint(tmp_path: Path):
     )
 
     assert proc.returncode != 0
-    assert "dummy-hf-moe" in proc.stderr
+    assert "allow_full_model_run=true" in proc.stderr
+
+
+def test_train_loop_opted_in_transformers_entrypoint_uses_checkpoint(monkeypatch, tmp_path: Path):
+    from slimder_man.distill import train_loop
+
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/tiny-moe"},
+        runtime={"local": {"allow_full_model_run": True}},
+        calibration={"sample_count": 2, "sequence_length": 8},
+        training={"train_steps": 1, "global_batch_size": 1, "micro_batch_size": 1, "warmup_steps": 0},
+        kd={"teacher_mode": "online_full_logits"},
+    )
+    config_path = tmp_path / "generic.yaml"
+    checkpoint = tmp_path / "compressed"
+    checkpoint.mkdir()
+    save_config(cfg, config_path)
+
+    monkeypatch.setattr(train_loop, "_load_entrypoint_transformers_model", lambda _cfg: DummyHfMoeForCausalLM())
+    monkeypatch.setattr(train_loop, "_load_entrypoint_transformers_checkpoint", lambda _cfg, _checkpoint: DummyHfMoeForCausalLM())
+    monkeypatch.setattr(train_loop, "_load_entrypoint_transformers_tokenizer", lambda _cfg: DummyTokenizer())
+
+    payload = run_train_loop_entrypoint(config_path, tmp_path / "training", checkpoint=checkpoint)
+
+    assert payload["mode"] == "transformers"
+    assert payload["student_checkpoint"] == str(checkpoint)
+    assert payload["global_step"] == 1
+    assert (tmp_path / "training" / "final" / "model.safetensors").exists()
 
 
 def test_accelerate_launch_train_loop_tiny_cpu(tmp_path: Path):
