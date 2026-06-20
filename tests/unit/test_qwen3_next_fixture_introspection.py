@@ -57,6 +57,22 @@ def test_qwen3_next_adapter_reports_actual_sparse_moe_block_indices():
     assert info.num_layers == 3
 
 
+def test_qwen3_next_adapter_prefers_config_layer_types_and_shared_intermediate_field():
+    config = DummyHfMoeConfig(model_type="qwen3_next", num_hidden_layers=4, num_shared_experts=1)
+    model = DummyHfMoeForCausalLM(config)
+    model.config.num_shared_experts = None
+    model.config.shared_expert_intermediate_size = 512
+    model.config.layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+    adapter = Qwen3NextAdapter()
+
+    info = adapter.describe_architecture(model)
+
+    assert info.block_kinds == ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+    assert info.num_linear_attention_layers == 3
+    assert info.num_full_attention_layers == 1
+    assert info.moe_layers[0].num_shared_experts == 1
+
+
 def test_qwen3_next_fixture_compresses_width_depth_and_experts(tmp_path: Path):
     config = DummyHfMoeConfig(model_type="qwen3_next")
     model = DummyHfMoeForCausalLM(config)

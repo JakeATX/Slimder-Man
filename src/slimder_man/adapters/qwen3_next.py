@@ -28,8 +28,8 @@ class Qwen3NextAdapter:
         moe_layers = self.iter_moe_layers(model)
         top_k = int(getattr(cfg, "num_experts_per_tok", getattr(cfg, "moe_top_k", 0)) or 0)
         n_experts = int(getattr(cfg, "num_experts", getattr(cfg, "n_routed_experts", 0)) or 0)
-        shared = int(getattr(cfg, "num_shared_experts", 0) or 0)
-        block_kinds = [self.get_block_kind(layer) for layer in layers]
+        shared = self._shared_expert_count(cfg)
+        block_kinds = self._block_kinds(cfg, layers)
         emb = getattr(model, "embed_tokens", None) or getattr(getattr(model, "model", None), "embed_tokens", None)
         head = getattr(model, "lm_head", None)
         tied = bool(emb is not None and head is not None and getattr(emb, "weight", None) is getattr(head, "weight", None))
@@ -47,7 +47,7 @@ class Qwen3NextAdapter:
                 MoELayerInfo(
                     self._layer_idx_for_moe(moe, layers, fallback=i),
                     n_experts or len(self.get_routed_experts(moe)),
-                    shared or len(self.get_shared_experts(moe)),
+                    max(shared, len(self.get_shared_experts(moe))),
                     top_k or int(getattr(moe, "top_k", getattr(moe, "num_experts_per_tok", getattr(moe, "moe_top_k", 0))) or 0),
                 )
                 for i, moe in enumerate(moe_layers)
@@ -154,3 +154,27 @@ class Qwen3NextAdapter:
             if any(child is moe for child in layer.modules()):
                 return idx
         return fallback
+
+    def _shared_expert_count(self, cfg: object | None) -> int:
+        if cfg is None:
+            return 0
+        for name in ("num_shared_experts", "n_shared_experts"):
+            value = getattr(cfg, name, None)
+            if value is not None:
+                return int(value)
+        return 1 if int(getattr(cfg, "shared_expert_intermediate_size", 0) or 0) > 0 else 0
+
+    def _block_kinds(self, cfg: object | None, layers: list[nn.Module]) -> list[str]:
+        raw = getattr(cfg, "layer_types", None) if cfg is not None else None
+        if isinstance(raw, (list, tuple)) and raw:
+            values = [self._normalize_block_kind(str(item)) for item in raw]
+            return [values[idx % len(values)] for idx in range(len(layers))]
+        return [self.get_block_kind(layer) for layer in layers]
+
+    def _normalize_block_kind(self, value: str) -> str:
+        text = value.lower()
+        if "linear" in text or "delta" in text:
+            return "linear_attention"
+        if "full" in text or "attention" in text:
+            return "full_attention"
+        return text or "other"
