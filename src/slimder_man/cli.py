@@ -167,11 +167,23 @@ def _requires_applied_plan(cfg: SlimderConfig) -> bool:
     return cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe"
 
 
+def _requires_smoke_trainer_opt_in(cfg: SlimderConfig) -> bool:
+    return cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe"
+
+
 def _reject_missing_required_plan(cfg: SlimderConfig) -> None:
     if _requires_applied_plan(cfg) and cfg.compression.plan is None:
         raise typer.BadParameter(
             "compression.plan is required before compressing arbitrary Transformers checkpoints. "
             "Run slimder recommend --candidate-id <id> --write-config <path> first."
+        )
+
+
+def _reject_disabled_smoke_trainer(cfg: SlimderConfig) -> None:
+    if _requires_smoke_trainer_opt_in(cfg) and not cfg.training.allow_smoke_trainer:
+        raise typer.BadParameter(
+            "The single-process smoke distillation trainer is disabled for arbitrary Transformers checkpoints. "
+            "Set training.allow_smoke_trainer=true only for explicit small-model smoke runs; use remote/distributed launch for production."
         )
 
 
@@ -514,6 +526,7 @@ def distill(config: Path, stage: int = 1, resume: bool = False, json_output: boo
             student = TinyMoEForCausalLM.from_pretrained(ckpt) if ckpt.exists() else TinyMoEForCausalLM()
         result = train_tiny_distill(teacher, student, cfg, Path(cfg.project.output_dir) / "training", resume=resume)
     else:
+        _reject_disabled_smoke_trainer(cfg)
         if not ckpt.exists():
             raise typer.BadParameter(f"Compressed checkpoint not found: {ckpt}")
         teacher = _load_model(cfg)
@@ -538,6 +551,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
                 "Full local run for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true. "
                 "Use --dry-run, explicit staged analyze/compress/distill commands, or remote launch for large checkpoints."
             )
+        _reject_disabled_smoke_trainer(cfg)
         _reject_missing_required_plan(cfg)
         teacher = _load_model(cfg)
         arch = describe_model(teacher)

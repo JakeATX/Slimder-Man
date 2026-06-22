@@ -17,6 +17,6 @@ def slimqwen_anchor_config() -> SlimderConfig:
             "target": {"hidden_size": 1536, "remove_last_n_layers": 12, "routed_experts": 256, "routed_top_k": 8, "shared_experts": "keep"},
         },
         progressive={"schedule": "depth_first", "stages": 2, "token_split": [0.1, 0.9]},
-        training={"token_budget": 400_000_000_000, "global_batch_size": 1024, "sequence_length": 4096, "precision": "bf16"},
+        training={"token_budget": 400_000_000_000, "train_steps": 0, "global_batch_size": 1024, "sequence_length": 4096, "precision": "bf16"},
     )
     return cfg

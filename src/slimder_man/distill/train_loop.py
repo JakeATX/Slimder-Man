@@ -78,6 +78,28 @@ def _validate_teacher_mode(cfg: SlimderConfig) -> None:
         raise ValueError("paper_faithful mode rejects offline_topk_logit_cache")
 
 
+def _is_arbitrary_transformers_checkpoint(cfg: SlimderConfig) -> bool:
+    return cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe"
+
+
+def _validate_smoke_trainer_allowed(cfg: SlimderConfig) -> None:
+    if _is_arbitrary_transformers_checkpoint(cfg) and not cfg.training.allow_smoke_trainer:
+        raise ValueError(
+            "The single-process smoke distillation trainer is disabled for arbitrary Transformers checkpoints. "
+            "Set training.allow_smoke_trainer=true only for explicit small-model smoke runs; use a distributed engine for production training."
+        )
+
+
+def _validate_paper_faithful_mtp_available(cfg: SlimderConfig, student_out) -> None:
+    if not (cfg.project.paper_faithful and cfg.kd.mtp.enabled and _is_arbitrary_transformers_checkpoint(cfg)):
+        return
+    if not bool(getattr(student_out, "mtp_logits", [])):
+        raise ValueError(
+            "paper_faithful=true with kd.mtp.enabled=true requires student MTP logits; "
+            "the smoke trainer will not silently drop MTP losses for arbitrary Transformers checkpoints."
+        )
+
+
 def _teacher_logits_client(cfg: SlimderConfig, teacher_logits_client: TeacherLogitsClient | None) -> TeacherLogitsClient | None:
     if teacher_logits_client is not None:
         return teacher_logits_client
@@ -284,6 +306,7 @@ def train_causal_lm_distill(
 ) -> dict:
     """Small generic HF-style distillation loop used by non-tiny smoke fixtures."""
     _validate_teacher_mode(cfg)
+    _validate_smoke_trainer_allowed(cfg)
     remote_client = _teacher_logits_client(cfg, teacher_logits_client)
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -345,6 +368,7 @@ def train_causal_lm_distill(
             with torch.no_grad():
                 teacher_out = _teacher_output(teacher, micro_batch, remote_client, attention_mask=attention_mask)
             student_out = _model_output(student, micro_batch, attention_mask=attention_mask)
+            _validate_paper_faithful_mtp_available(cfg, student_out)
             loss, parts = total_distill_loss(
                 student_out,
                 teacher_out,
@@ -453,6 +477,7 @@ def run_train_loop_entrypoint(
                 "train_loop entrypoint for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true "
                 "to avoid accidental full-model downloads. Pass --checkpoint with a compressed student checkpoint and opt in explicitly."
             )
+        _validate_smoke_trainer_allowed(cfg)
         init_checkpoint = Path(checkpoint) if checkpoint else None
         if resume and (out_dir / "resume_model").exists():
             init_checkpoint = out_dir / "resume_model"

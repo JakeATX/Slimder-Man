@@ -137,6 +137,7 @@ class TrainingConfig(StrictBaseModel):
     max_grad_norm: float = 1.0
     train_steps: int = 5
     save_every_steps: int = 1000
+    allow_smoke_trainer: bool = False
     moe_aux_loss: MoeAuxLossConfig = Field(default_factory=MoeAuxLossConfig)
 
 

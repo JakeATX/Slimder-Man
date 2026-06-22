@@ -82,7 +82,7 @@ def test_train_loop_opted_in_transformers_entrypoint_uses_checkpoint(monkeypatch
         teacher={"load_mode": "transformers", "model_id_or_path": "org/tiny-moe"},
         runtime={"local": {"allow_full_model_run": True}},
         calibration={"sample_count": 2, "sequence_length": 8},
-        training={"train_steps": 1, "global_batch_size": 1, "micro_batch_size": 1, "warmup_steps": 0},
+        training={"train_steps": 1, "global_batch_size": 1, "micro_batch_size": 1, "warmup_steps": 0, "allow_smoke_trainer": True},
         kd={"teacher_mode": "online_full_logits"},
     )
     config_path = tmp_path / "generic.yaml"
@@ -100,6 +100,21 @@ def test_train_loop_opted_in_transformers_entrypoint_uses_checkpoint(monkeypatch
     assert payload["student_checkpoint"] == str(checkpoint)
     assert payload["global_step"] == 1
     assert (tmp_path / "training" / "final" / "model.safetensors").exists()
+
+
+def test_train_loop_entrypoint_requires_explicit_smoke_trainer_opt_in(tmp_path: Path):
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "run")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/tiny-moe"},
+        runtime={"local": {"allow_full_model_run": True}},
+    )
+    config_path = tmp_path / "generic.yaml"
+    checkpoint = tmp_path / "compressed"
+    checkpoint.mkdir()
+    save_config(cfg, config_path)
+
+    with pytest.raises(ValueError, match="allow_smoke_trainer=true"):
+        run_train_loop_entrypoint(config_path, tmp_path / "training", checkpoint=checkpoint)
 
 
 def test_accelerate_launch_train_loop_tiny_cpu(tmp_path: Path):

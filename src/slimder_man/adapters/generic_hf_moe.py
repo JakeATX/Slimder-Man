@@ -91,16 +91,34 @@ def _find_router(moe: nn.Module) -> nn.Linear | None:
     return handle.router if handle is not None else None
 
 
-def _slice_linear(module: nn.Linear, keep_idx: torch.Tensor, *, slice_in: bool, slice_out: bool) -> None:
+def _slice_linear(
+    module: nn.Linear,
+    keep_idx: torch.Tensor,
+    *,
+    slice_in: bool,
+    slice_out: bool,
+    expected_in_features: int | None = None,
+    expected_out_features: int | None = None,
+) -> None:
     weight = module.weight.detach()
     bias_param = module.bias
     bias = bias_param.detach() if bias_param is not None else None
     index = keep_idx.to(weight.device)
     if slice_out:
+        if expected_out_features is not None and module.out_features != expected_out_features:
+            raise ValueError(
+                f"Refusing to slice {module.__class__.__name__} output axis: expected {expected_out_features} features, "
+                f"found {module.out_features}. This usually means the module was already sliced or the width rule chose the wrong axis."
+            )
         weight = weight.index_select(0, index)
         bias = bias.index_select(0, index.to(bias.device)) if bias is not None else None
         module.out_features = keep_idx.numel()
     if slice_in:
+        if expected_in_features is not None and module.in_features != expected_in_features:
+            raise ValueError(
+                f"Refusing to slice {module.__class__.__name__} input axis: expected {expected_in_features} features, "
+                f"found {module.in_features}. This usually means the module was already sliced or the width rule chose the wrong axis."
+            )
         weight = weight.index_select(1, index)
         module.in_features = keep_idx.numel()
     module.weight = nn.Parameter(weight.clone(), requires_grad=module.weight.requires_grad)
@@ -164,6 +182,7 @@ def slice_structural_hidden_channels(model: nn.Module, keep_idx: torch.Tensor, h
                 embedding_heads.append((embedding, head))
 
     unsupported: list[str] = []
+    sliced_linear_ids: set[int] = set()
     for name, module in named:
         if isinstance(module, nn.Embedding) and module.weight.shape[1] == old_hidden:
             module.weight = nn.Parameter(
@@ -173,6 +192,8 @@ def slice_structural_hidden_channels(model: nn.Module, keep_idx: torch.Tensor, h
             module.embedding_dim = keep_idx.numel()
             continue
         if isinstance(module, nn.Linear):
+            if id(module) in sliced_linear_ids:
+                continue
             rule = _linear_slice_rule(name, module, old_hidden, is_router=id(module) in router_ids)
             if rule is None:
                 if module.in_features == old_hidden or module.out_features == old_hidden:
@@ -185,7 +206,15 @@ def slice_structural_hidden_channels(model: nn.Module, keep_idx: torch.Tensor, h
             if leaf in {"o_proj", "out_proj"} and module.in_features == old_hidden:
                 preserves_attention_width = True
             if slice_in or slice_out:
-                _slice_linear(module, keep_idx, slice_in=slice_in, slice_out=slice_out)
+                _slice_linear(
+                    module,
+                    keep_idx,
+                    slice_in=slice_in,
+                    slice_out=slice_out,
+                    expected_in_features=old_hidden if slice_in else None,
+                    expected_out_features=old_hidden if slice_out else None,
+                )
+                sliced_linear_ids.add(id(module))
             continue
         if (
             hasattr(module, "weight")

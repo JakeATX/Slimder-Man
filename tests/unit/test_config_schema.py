@@ -1,6 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
+from slimder_man.config.defaults import slimqwen_anchor_config
 from slimder_man.config.schema import SlimderConfig
 
 
@@ -37,6 +38,17 @@ def test_paper_faithful_rejects_non_default_schedules_and_expert_prune():
 def test_augmented_config_accepts_saliency_quantization():
     cfg = SlimderConfig(project={"paper_faithful": False}, quantization={"enabled": True})
     assert cfg.quantization.enabled
+
+
+def test_smoke_trainer_opt_in_defaults_off():
+    assert SlimderConfig().training.allow_smoke_trainer is False
+    assert SlimderConfig(training={"allow_smoke_trainer": True}).training.allow_smoke_trainer is True
+
+
+def test_slimqwen_anchor_uses_token_budget_for_optimizer_steps():
+    cfg = slimqwen_anchor_config()
+    assert cfg.training.token_budget == 400_000_000_000
+    assert cfg.training.train_steps == 0
 
 
 def test_expert_outputs_similarity_is_rejected_until_real_output_sketches_exist():

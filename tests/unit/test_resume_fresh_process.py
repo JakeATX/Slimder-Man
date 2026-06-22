@@ -214,6 +214,35 @@ def test_generic_distill_rejects_unsupported_teacher_modes(tmp_path: Path):
         train_causal_lm_distill(teacher, student, cfg, tmp_path / "unsupported", batches)
 
 
+def test_generic_distill_rejects_arbitrary_transformers_without_smoke_trainer_opt_in(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = DummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/tiny-moe"},
+        training={"train_steps": 1},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    with pytest.raises(ValueError, match="allow_smoke_trainer=true"):
+        train_causal_lm_distill(teacher, student, cfg, tmp_path / "smoke_guard", batches)
+
+
+def test_generic_distill_rejects_missing_mtp_logits_in_paper_faithful_arbitrary_run(tmp_path: Path):
+    teacher = DummyHfMoeForCausalLM()
+    student = DummyHfMoeForCausalLM()
+    cfg = SlimderConfig(
+        project={"paper_faithful": True, "output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/no-mtp-moe"},
+        training={"train_steps": 1, "global_batch_size": 1, "micro_batch_size": 1, "warmup_steps": 0, "allow_smoke_trainer": True},
+        kd={"mtp": {"enabled": True}},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=student.config.vocab_size)
+
+    with pytest.raises(ValueError, match="requires student MTP logits"):
+        train_causal_lm_distill(teacher, student, cfg, tmp_path / "mtp_guard", batches)
+
+
 def test_generic_distill_offline_full_logits_cache_uses_exact_entries(tmp_path: Path):
     teacher = RaisingTeacher()
     student = DummyHfMoeForCausalLM()

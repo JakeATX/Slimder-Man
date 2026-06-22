@@ -403,6 +403,32 @@ def test_compress_rejects_arbitrary_transformers_without_applied_plan_before_loa
     assert loaded is False
 
 
+def test_run_rejects_non_dummy_transformers_without_smoke_trainer_opt_in(monkeypatch, tmp_path: Path):
+    from slimder_man import cli
+
+    loaded = False
+
+    def fail_if_loaded(_cfg):
+        nonlocal loaded
+        loaded = True
+        raise AssertionError("disabled smoke trainer should reject before model loading")
+
+    monkeypatch.setattr(cli, "_load_model", fail_if_loaded)
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "org/tiny-moe"},
+        runtime={"local": {"allow_full_model_run": True}},
+    )
+    config_path = tmp_path / "qwen.yaml"
+    config_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+
+    result = CliRunner().invoke(app, ["run", str(config_path), "--json"])
+
+    assert result.exit_code != 0
+    assert "allow_smoke_trainer=true" in result.output
+    assert loaded is False
+
+
 def test_run_accepts_opted_in_non_dummy_transformers_through_generic_hf_pipeline(monkeypatch, tmp_path: Path):
     from slimder_man import cli
 
@@ -412,7 +438,7 @@ def test_run_accepts_opted_in_non_dummy_transformers_through_generic_hf_pipeline
         student={"output_format": "hf_safetensors"},
         runtime={"local": {"allow_full_model_run": True}},
         calibration={"sample_count": 2, "sequence_length": 8},
-        training={"train_steps": 1, "micro_batch_size": 1, "global_batch_size": 1},
+        training={"train_steps": 1, "micro_batch_size": 1, "global_batch_size": 1, "allow_smoke_trainer": True},
         compression={"target": {"hidden_size": 12, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
     )
     from slimder_man.analyze.plans import apply_recommendation_to_config
