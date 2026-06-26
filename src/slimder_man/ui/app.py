@@ -7,6 +7,7 @@ from pathlib import Path
 
 from slimder_man.config.schema import SlimderConfig
 from slimder_man.config.defaults import tiny_default_config
+from slimder_man.orchestration.compute_guidance import compute_guidance, compute_guidance_markdown
 
 
 def build_config_yaml(
@@ -258,6 +259,11 @@ def config_warnings(yaml_text: str) -> str:
     return "\n".join(warnings) if warnings else "No warnings."
 
 
+def compute_guidance_from_yaml(yaml_text: str) -> str:
+    cfg = _config_from_yaml(yaml_text)
+    return compute_guidance_markdown(compute_guidance(cfg))
+
+
 def paper_faithful_quant_state(paper_faithful: bool) -> dict:
     if paper_faithful:
         return {"value": False, "interactive": False}
@@ -351,6 +357,9 @@ def create_app(test_mode: bool = False):
                 artifacts_btn = gr.Button("Refresh Artifacts")
                 artifacts_out = gr.Textbox(lines=12, label="Artifacts")
                 warnings_out = gr.Textbox(value="No warnings.", lines=4, label="Warnings")
+            with gr.Tab("Compute"):
+                guidance_btn = gr.Button("Refresh Compute Guidance")
+                guidance_out = gr.Markdown(value=compute_guidance_from_yaml(build_config_yaml()))
             with gr.Tab("Config"):
                 output = gr.Code(value=build_config_yaml(), label="Generated YAML", language="yaml")
                 btn = gr.Button("Generate Config")
@@ -495,6 +504,7 @@ def create_app(test_mode: bool = False):
             outputs=[launch_out],
         )
         run_btn.click(lambda yaml_text, selected: _run_from_yaml(yaml_text, "run", preset_value=selected), inputs=[output, preset], outputs=[run_out])
+        guidance_btn.click(compute_guidance_from_yaml, inputs=[output], outputs=[guidance_out])
         logs_btn.click(log_tail, inputs=[output_dir], outputs=[logs_out])
         artifacts_btn.click(artifact_index, inputs=[output_dir], outputs=[artifacts_out])
     return demo

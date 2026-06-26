@@ -1,0 +1,137 @@
+project:
+  name: qwen36_35b_a3b_remote
+  output_dir: runs/qwen36_35b_a3b_remote
+  seed: 1337
+  paper_faithful: true
+teacher:
+  model_id_or_path: Qwen/Qwen3.6-35B-A3B
+  revision: null
+  dtype: bfloat16
+  trust_remote_code: true
+  load_mode: transformers
+  tensor_parallel: auto
+  device_map: auto
+student:
+  init_from: teacher_pruned
+  output_format: hf_safetensors
+  tie_embeddings: auto
+calibration:
+  dataset:
+    type: hf_dataset
+    name: allenai/c4
+    path: null
+    split: train
+    text_field: text
+  sample_count: 2048
+  sequence_length: 4096
+  packing: true
+  seed: 1337
+  expert_balanced_sampling: true
+compression:
+  preset: balanced_50
+  target:
+    total_param_reduction: null
+    active_param_reduction: null
+    hidden_size: 1536
+    depth_remove_fraction: null
+    remove_last_n_layers: 10
+    routed_experts: 128
+    routed_top_k: 6
+    shared_experts: keep
+  plan: null
+  depth:
+    method: last_layers
+  width:
+    method: rmsnorm_mean_abs
+    hidden_size_multiple: 128
+  experts:
+    method: partial_preservation_merge
+    importance_metric: soft_logits
+    similarity_metric: router_weights
+    base_selection: next_highest_importance
+    router_row_strategy: base
+    keep_shared_experts: true
+progressive:
+  schedule: depth_first
+  stages: 2
+  token_split:
+    - 0.1
+    - 0.9
+training:
+  token_budget: 1000000000
+  global_batch_size: auto
+  micro_batch_size: auto
+  sequence_length: 4096
+  optimizer: adamw
+  learning_rate: 0.0004
+  min_learning_rate: 0.00003
+  lr_schedule: cosine_decay
+  warmup_steps: 2000
+  precision: bf16
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  train_steps: 10000
+  save_every_steps: 1000
+  allow_smoke_trainer: false
+  moe_aux_loss:
+    global_batch_load_balancing: true
+    weight: adapter_default
+kd:
+  enabled: true
+  teacher_mode: online_full_logits
+  offline_full_logits_cache_path: null
+  offline_topk_logits_cache_path: null
+  temperature: 1.0
+  lambda_schedule:
+    type: linear
+    start: 1.0
+    end: 0.75
+  mtp:
+    enabled: true
+    depths: adapter_default
+    beta_schedule:
+      type: cosine
+      start: 0.3
+      end: 0.1
+quantization:
+  enabled: false
+  mode: fake_quant_export
+  apply_stage: post_distill
+  target_avg_bits: null
+  prune_shared_experts: false
+evaluation:
+  eval_every_steps: 10000
+  perplexity:
+    enabled: true
+    dataset_name: synthetic
+    split: test
+  tasks: []
+  smoke_prompts: true
+  speculative_acceptance: true
+runtime:
+  backend: skypilot
+  local:
+    num_gpus: auto
+    allow_full_model_run: false
+  ssh:
+    host: null
+    user: null
+    port: 22
+    key_path: null
+    dry_run: true
+  skypilot:
+    cluster_name: slimder-qwen36
+    accelerators: H100:4
+    cloud: auto
+    region: null
+    image_id: null
+    disk_size_gb: 1024
+    autostop_minutes: 60
+    dry_run: true
+  worker:
+    api_url: null
+    auth_token: null
+    auth_token_env: SLIMDER_WORKER_TOKEN
+    timeout_seconds: 60.0
+  tracking:
+    backend: tensorboard

@@ -29,6 +29,7 @@ from slimder_man.distill.train_loop import train_causal_lm_distill, train_tiny_d
 from slimder_man.distill.stage_runner import run_generic_progressive_stages, run_tiny_progressive_stages
 from slimder_man.eval.perplexity import causal_lm_perplexity, tiny_perplexity
 from slimder_man.orchestration.local import local_dry_run_commands
+from slimder_man.orchestration.compute_guidance import compute_guidance, compute_guidance_markdown
 from slimder_man.orchestration.skypilot import SkyPilotRunner, skypilot_yaml
 from slimder_man.orchestration.ssh import SSHRunner, ssh_dry_run_commands
 from slimder_man.orchestration.worker_client import WorkerAPIRunner
@@ -368,6 +369,7 @@ def _dry_run_plan(cfg: SlimderConfig, config_path: Path | None = None) -> dict:
             for idx in range(cfg.progressive.stages)
         ],
         "paper_faithful": cfg.project.paper_faithful,
+        "compute_guidance": compute_guidance(cfg),
     }
     if config_path is not None:
         local_plan = local_dry_run_commands(config_path, cfg)
@@ -398,6 +400,16 @@ def init_config(out: Path = Path("config.yaml"), json_output: bool = typer.Optio
     cfg = tiny_default_config()
     save_config(cfg, out)
     _echo({"config": str(out)}, json_output)
+
+
+@app.command(name="compute-guidance")
+def compute_guidance_cmd(config: Path, json_output: bool = typer.Option(False, "--json")) -> None:
+    cfg = _load_cli_config(config)
+    guidance = compute_guidance(cfg)
+    if json_output:
+        _echo(guidance, True)
+    else:
+        typer.echo(compute_guidance_markdown(guidance))
 
 
 @app.command()
@@ -724,12 +736,13 @@ def quantize(config: Path, checkpoint: Path, json_output: bool = typer.Option(Fa
 @app.command()
 def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(False, "--json")) -> None:
     cfg = _load_cli_config(config)
+    guidance = compute_guidance(cfg)
     if backend == "local":
         plan = local_dry_run_commands(config, cfg)
-        result = {"backend": "local", "commands": plan.commands, "preflight": plan.preflight, "output_dir": plan.output_dir}
+        result = {"backend": "local", "commands": plan.commands, "preflight": plan.preflight, "output_dir": plan.output_dir, "compute_guidance": guidance}
     elif backend == "ssh":
         if cfg.runtime.ssh.dry_run:
-            result = {"backend": "ssh", "dry_run": True, "commands": ssh_dry_run_commands(config, cfg).commands}
+            result = {"backend": "ssh", "dry_run": True, "commands": ssh_dry_run_commands(config, cfg).commands, "compute_guidance": guidance}
         else:
             run = SSHRunner(config, cfg).launch()
             result = {
@@ -739,10 +752,11 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
                 "commands": run.commands,
                 "failed_command": run.failed_command,
                 "results": [r.__dict__ for r in run.results],
+                "compute_guidance": guidance,
             }
     elif backend == "skypilot":
         if cfg.runtime.skypilot.dry_run:
-            result = {"backend": "skypilot", "dry_run": True, "yaml": skypilot_yaml(config, cfg)}
+            result = {"backend": "skypilot", "dry_run": True, "yaml": skypilot_yaml(config, cfg), "compute_guidance": guidance}
         else:
             run = SkyPilotRunner(config, cfg).launch()
             result = {
@@ -753,6 +767,7 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
                 "commands": run.commands,
                 "failed_command": run.failed_command,
                 "results": [r.__dict__ for r in run.results],
+                "compute_guidance": guidance,
             }
     elif backend == "worker":
         run = WorkerAPIRunner(config, cfg).launch(dry_run=False)
@@ -762,6 +777,7 @@ def launch(config: Path, backend: str = "ssh", json_output: bool = typer.Option(
             "api_url": run.api_url,
             "job": run.job,
             "dry_run": run.dry_run,
+            "compute_guidance": guidance,
         }
     else:
         result = {"backend": backend, "status": "unsupported"}

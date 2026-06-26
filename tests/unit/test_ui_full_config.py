@@ -2,7 +2,7 @@ import json
 import yaml
 
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.ui.app import artifact_index, apply_candidate_to_yaml, build_config_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command, run_ui_yaml_command
+from slimder_man.ui.app import artifact_index, apply_candidate_to_yaml, build_config_yaml, compute_guidance_from_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command, run_ui_yaml_command
 
 
 def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
@@ -248,3 +248,20 @@ def test_ui_warnings_surface_high_risk_and_full_model_contract(tmp_path):
     assert "Non-paper-faithful" in warning_text
     assert "allow_full_model_run=true" in warning_text
     assert "allow_smoke_trainer=true" in warning_text
+
+
+def test_ui_compute_guidance_from_yaml_for_qwen36(tmp_path):
+    yaml_text = build_config_yaml(
+        project_name="qwen36",
+        teacher_model_id_or_path="Qwen/Qwen3.6-35B-A3B",
+        teacher_load_mode="transformers",
+        teacher_dtype="bfloat16",
+        runtime_backend="skypilot",
+        output_dir=str(tmp_path / "qwen36"),
+    )
+
+    guidance = compute_guidance_from_yaml(yaml_text)
+
+    assert "Compute guidance for Qwen/Qwen3.6-35B-A3B" in guidance
+    assert "35.0B total" in guidance
+    assert "full-logit" in guidance
