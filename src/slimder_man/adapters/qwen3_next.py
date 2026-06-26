@@ -147,6 +147,112 @@ class Qwen3NextAdapter:
             return list(experts.values())
         return list(experts)
 
+    def routed_expert_count(self, moe: nn.Module) -> int:
+        packed = _packed_experts(moe)
+        if packed is not None:
+            return int(packed.gate_up_proj.shape[0])
+        return len(self.get_routed_experts(moe))
+
+    def selected_expert_output_norm2(
+        self,
+        moe: nn.Module,
+        hidden: torch.Tensor,
+        topi: torch.Tensor,
+        num_experts: int,
+    ) -> torch.Tensor | None:
+        packed = _packed_experts(moe)
+        if packed is None:
+            return None
+        gate_up_weight = packed.gate_up_proj
+        down_weight = packed.down_proj
+        act_fn = getattr(packed, "act_fn", None) or nn.SiLU()
+        norm2 = torch.zeros(topi.shape[0], num_experts, dtype=torch.float32)
+        for slot in range(topi.shape[1]):
+            selected = torch.unique(topi[:, slot].detach().cpu())
+            for raw_idx in selected.tolist():
+                expert_idx = int(raw_idx)
+                if expert_idx < 0 or expert_idx >= num_experts:
+                    continue
+                mask = (topi[:, slot].detach().cpu() == expert_idx)
+                if not bool(mask.any()):
+                    continue
+                expert_input = hidden[mask.to(hidden.device)].to(device=gate_up_weight.device, dtype=gate_up_weight.dtype)
+                gate_up = F.linear(expert_input, gate_up_weight[expert_idx])
+                gate, up = gate_up.chunk(2, dim=-1)
+                output = F.linear(act_fn(gate) * up, down_weight[expert_idx])
+                norm2[mask, expert_idx] = output.detach().float().pow(2).sum(dim=-1).cpu()
+        return norm2
+
+    def merge_or_prune_packed_experts(
+        self,
+        moe: nn.Module,
+        scores: torch.Tensor,
+        similarity: torch.Tensor,
+        target_experts: int,
+        method: str,
+        router_row_strategy: str,
+        new_top_k: int,
+    ):
+        packed = _packed_experts(moe)
+        if packed is None:
+            return None
+        from types import SimpleNamespace
+
+        from slimder_man.compression.experts import partial_preservation_plan
+        from slimder_man.compression.router import router_rows_for_merge
+
+        old_n = int(packed.gate_up_proj.shape[0])
+        if target_experts <= 0 or target_experts > old_n:
+            raise ValueError("target expert count must be between 1 and original expert count")
+        if target_experts == old_n:
+            plan = SimpleNamespace(s_keep=list(range(old_n)), s_base=[], groups={}, new_expert_order=list(range(old_n)), warning=None)
+            rows = router_rows_for_merge(self.get_router(moe).weight.detach(), plan.s_keep, plan.s_base, router_row_strategy)
+            self._replace_packed_expert_tensors(moe, packed.gate_up_proj.detach(), packed.down_proj.detach(), rows, new_top_k)
+            return plan
+        if method == "prune":
+            order = torch.argsort(scores.detach().cpu(), descending=True, stable=True).tolist()[:target_experts]
+            plan = SimpleNamespace(s_keep=order, s_base=[], groups={}, new_expert_order=order, warning=None)
+            keep = torch.tensor(order, dtype=torch.long, device=packed.gate_up_proj.device)
+            new_gate_up = packed.gate_up_proj.detach().index_select(0, keep).clone()
+            new_down = packed.down_proj.detach().index_select(0, keep.to(packed.down_proj.device)).clone()
+        else:
+            plan = partial_preservation_plan(scores.detach().cpu(), similarity.detach().cpu(), target_experts)
+            new_gate_up_parts = [packed.gate_up_proj.detach()[idx].clone() for idx in plan.s_keep]
+            new_down_parts = [packed.down_proj.detach()[idx].clone() for idx in plan.s_keep]
+            warning = None
+            for base in plan.s_base:
+                indices = [base] + plan.groups[base]
+                group_scores = scores.detach().cpu()[indices]
+                finite = torch.isfinite(group_scores) & (group_scores > 0)
+                if not bool(finite.any()):
+                    warning = "all merge scores were zero or nonfinite; used uniform weights"
+                    weights = torch.ones_like(group_scores, dtype=torch.float64)
+                else:
+                    weights = torch.where(
+                        finite,
+                        torch.clamp(group_scores.to(torch.float64), min=1e-12),
+                        torch.zeros_like(group_scores, dtype=torch.float64),
+                    )
+                weights = weights / weights.sum()
+                gate_up = sum(
+                    weights[i].to(device=packed.gate_up_proj.device, dtype=packed.gate_up_proj.dtype)
+                    * packed.gate_up_proj.detach()[idx]
+                    for i, idx in enumerate(indices)
+                )
+                down = sum(
+                    weights[i].to(device=packed.down_proj.device, dtype=packed.down_proj.dtype)
+                    * packed.down_proj.detach()[idx]
+                    for i, idx in enumerate(indices)
+                )
+                new_gate_up_parts.append(gate_up.clone())
+                new_down_parts.append(down.clone())
+            plan.warning = warning
+            new_gate_up = torch.stack(new_gate_up_parts, dim=0)
+            new_down = torch.stack(new_down_parts, dim=0)
+        rows = router_rows_for_merge(self.get_router(moe).weight.detach(), plan.s_keep, plan.s_base, router_row_strategy)
+        self._replace_packed_expert_tensors(moe, new_gate_up, new_down, rows, new_top_k)
+        return plan
+
     def get_shared_experts(self, moe: nn.Module) -> list[nn.Module]:
         for attr in ("shared_experts", "shared_expert"):
             value = getattr(moe, attr, None)
@@ -262,6 +368,40 @@ class Qwen3NextAdapter:
         for attr in ("top_k", "num_experts_per_tok", "moe_top_k"):
             if hasattr(moe, attr):
                 setattr(moe, attr, min(new_top_k, len(new_experts)))
+
+    def _replace_packed_expert_tensors(
+        self,
+        moe: nn.Module,
+        gate_up: torch.Tensor,
+        down: torch.Tensor,
+        router_rows: torch.Tensor,
+        new_top_k: int,
+    ) -> None:
+        packed = _packed_experts(moe)
+        if packed is None:
+            raise ValueError("MoE layer does not contain packed Qwen experts")
+        packed.gate_up_proj = nn.Parameter(
+            gate_up.to(device=packed.gate_up_proj.device, dtype=packed.gate_up_proj.dtype).clone(),
+            requires_grad=packed.gate_up_proj.requires_grad,
+        )
+        packed.down_proj = nn.Parameter(
+            down.to(device=packed.down_proj.device, dtype=packed.down_proj.dtype).clone(),
+            requires_grad=packed.down_proj.requires_grad,
+        )
+        router = self.get_router(moe)
+        router.weight = nn.Parameter(
+            router_rows.to(device=router.weight.device, dtype=router.weight.dtype).clone(),
+            requires_grad=router.weight.requires_grad,
+        )
+        count = int(gate_up.shape[0])
+        top_k = min(int(new_top_k), count)
+        for module in (moe, router, packed):
+            for attr in ("num_experts", "n_routed_experts"):
+                if hasattr(module, attr):
+                    setattr(module, attr, count)
+            for attr in ("top_k", "num_experts_per_tok", "moe_top_k"):
+                if hasattr(module, attr):
+                    setattr(module, attr, top_k)
 
     def update_config_after_compression(self, model: nn.Module, manifest: dict) -> None:
         cfg = getattr(model, "config", None)

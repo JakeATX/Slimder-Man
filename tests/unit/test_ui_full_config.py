@@ -2,7 +2,7 @@ import json
 import yaml
 
 from slimder_man.config.schema import SlimderConfig
-from slimder_man.ui.app import artifact_index, apply_candidate_to_yaml, build_config_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command
+from slimder_man.ui.app import artifact_index, apply_candidate_to_yaml, build_config_yaml, config_warnings, log_tail, paper_faithful_quant_state, run_cli_with_yaml, run_ui_command, run_ui_yaml_command
 
 
 def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
@@ -44,6 +44,7 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
             worker_timeout_seconds=12.5,
             kd_teacher_mode="offline_full_logits_cache",
             offline_full_logits_cache_path="cache/full_logits.pt",
+            allow_smoke_trainer=True,
             tracking_backend="none",
             compression_preset="aggressive_80",
         )
@@ -64,6 +65,7 @@ def test_ui_config_generation_includes_teacher_dataset_and_runtime_fields():
     assert cfg.training.sequence_length == 128
     assert cfg.training.token_budget == 2048
     assert cfg.training.train_steps == 7
+    assert cfg.training.allow_smoke_trainer is True
     assert cfg.compression.preset == "aggressive_80"
     assert cfg.kd.teacher_mode == "offline_full_logits_cache"
     assert cfg.kd.offline_full_logits_cache_path == "cache/full_logits.pt"
@@ -206,6 +208,31 @@ def test_ui_command_uses_current_fields_without_generated_yaml(monkeypatch):
     assert cfg.calibration.sequence_length == 7
 
 
+def test_ui_yaml_command_uses_generated_yaml_as_execution_source(monkeypatch):
+    captured = {}
+
+    def fake_run(yaml_text: str, command: str, preset: str = "balanced_50", **kwargs) -> str:
+        captured["yaml"] = yaml_text
+        captured["command"] = command
+        captured["preset"] = preset
+        captured["kwargs"] = kwargs
+        return "{}"
+
+    monkeypatch.setattr("slimder_man.ui.app.run_cli_with_yaml", fake_run)
+    yaml_text = apply_candidate_to_yaml(build_config_yaml(project_name="ui_yaml_source"), "balanced_50")
+
+    result = run_ui_yaml_command(yaml_text, "compress", preset="balanced_50", stage=2)
+
+    cfg = SlimderConfig.model_validate(yaml.safe_load(captured["yaml"]))
+    assert result == "{}"
+    assert captured["command"] == "compress"
+    assert captured["kwargs"]["stage"] == 2
+    assert cfg.project.name == "ui_yaml_source"
+    assert cfg.compression.plan is not None
+    assert cfg.compression.plan.candidate_id == "balanced_50_1"
+    assert cfg.compression.target.hidden_size == 12
+
+
 def test_ui_warnings_surface_high_risk_and_full_model_contract(tmp_path):
     yaml_text = build_config_yaml(
         project_name="warn",
@@ -220,3 +247,4 @@ def test_ui_warnings_surface_high_risk_and_full_model_contract(tmp_path):
     assert "aggressive_80" in warning_text
     assert "Non-paper-faithful" in warning_text
     assert "allow_full_model_run=true" in warning_text
+    assert "allow_smoke_trainer=true" in warning_text

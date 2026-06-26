@@ -22,7 +22,11 @@ def test_remote_ssh_dryrun_cli(tmp_path):
     assert "run with space/training/final" not in result.output
     assert "nvidia-smi" in result.output
     assert "pip install -e .[dev]" in result.output
-    assert "slimder_man.cli analyze" in result.output
-    assert "slimder_man.cli compress" in result.output
-    assert "slimder_man.cli distill" in result.output
+    assert "slimder_man.cli recommend --config ~/slimder-man/configs/launch_config.yaml" in result.output
+    assert "--write-config ~/slimder-man/configs/launch_config.yaml" in result.output
+    assert "slimder_man.cli run ~/slimder-man/configs/launch_config.yaml --dry-run --json" in result.output
+    assert "slimder_man.cli run ~/slimder-man/configs/launch_config.yaml --json > logs/run.log" in result.output
+    assert "slimder_man.cli analyze" not in result.output
+    assert "slimder_man.cli compress" not in result.output
+    assert "slimder_man.cli distill" not in result.output
     assert "tail -n 200 -f" in result.output

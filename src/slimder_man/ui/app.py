@@ -50,6 +50,7 @@ def build_config_yaml(
     worker_timeout_seconds: float = 60.0,
     kd_teacher_mode: str = "online_full_logits",
     offline_full_logits_cache_path: str = "",
+    allow_smoke_trainer: bool = False,
 ) -> str:
     import yaml
 
@@ -73,6 +74,7 @@ def build_config_yaml(
     cfg.training.token_budget = int(token_budget)
     cfg.training.sequence_length = int(sequence_length)
     cfg.training.train_steps = int(train_steps)
+    cfg.training.allow_smoke_trainer = bool(allow_smoke_trainer)
     if compression_preset:
         cfg.compression.preset = compression_preset
     cfg.runtime.backend = runtime_backend
@@ -188,6 +190,24 @@ def run_ui_command(
     )
 
 
+def run_ui_yaml_command(
+    yaml_text: str,
+    command: str,
+    preset: str = "balanced_50",
+    stage: int = 1,
+    backend: str = "local",
+    checkpoint: str | None = None,
+) -> str:
+    return run_cli_with_yaml(
+        yaml_text,
+        command,
+        preset=preset,
+        stage=stage,
+        backend=backend,
+        checkpoint=checkpoint,
+    )
+
+
 def artifact_index(output_dir: str) -> str:
     out = Path(output_dir or "runs/tiny_moe_cpu_smoke")
     if not out.exists():
@@ -233,6 +253,8 @@ def config_warnings(yaml_text: str) -> str:
         warnings.append("Non-paper-faithful mode enables augmented behavior; manifests should be reviewed for contamination.")
     if cfg.teacher.load_mode == "transformers" and cfg.runtime.backend == "local" and not cfg.runtime.local.allow_full_model_run:
         warnings.append("Arbitrary Transformers local run requires runtime.local.allow_full_model_run=true; use launch/dry-run for large checkpoints.")
+    if cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe" and not cfg.training.allow_smoke_trainer:
+        warnings.append("Single-process Transformers distillation requires training.allow_smoke_trainer=true and should be limited to explicit small-model smoke runs.")
     return "\n".join(warnings) if warnings else "No warnings."
 
 
@@ -273,6 +295,7 @@ def create_app(test_mode: bool = False):
                 sequence_length = gr.Number(value=16, precision=0, label="Sequence length")
                 token_budget = gr.Number(value=1024, precision=0, label="Token budget")
                 train_steps = gr.Number(value=5, precision=0, label="Train steps")
+                allow_smoke_trainer = gr.Checkbox(value=False, label="Allow smoke trainer")
                 kd_teacher_mode = gr.Dropdown(["online_full_logits", "offline_full_logits_cache", "remote_worker_full_logits"], value="online_full_logits", label="KD teacher mode")
                 offline_cache = gr.Textbox(value="", label="Offline full-logit cache")
                 runtime_backend = gr.Dropdown(["local", "ssh", "skypilot", "worker"], value="local", label="Runtime backend")
@@ -333,7 +356,7 @@ def create_app(test_mode: bool = False):
                 btn = gr.Button("Generate Config")
                 run_btn = gr.Button("Run Tiny Pipeline")
                 run_out = gr.Code(language="json", label="Run Output")
-        def _build_from_ui(project_name, paper_faithful, quantization, teacher_model_id_or_path, teacher_load_mode, teacher_dtype, teacher_revision, trust_remote_code, dataset_type, dataset_name, dataset_path, dataset_split, text_field, sample_count, sequence_length, token_budget, train_steps, runtime_backend, local_num_gpus, local_allow_full_model_run, ssh_host, ssh_user, ssh_port, ssh_dry_run, skypilot_cluster_name, skypilot_accelerators, skypilot_cloud, skypilot_region, skypilot_image_id, skypilot_disk_size_gb, skypilot_autostop_minutes, skypilot_dry_run, worker_api_url, worker_auth_token_env, worker_timeout_seconds, kd_teacher_mode, offline_full_logits_cache_path, tracking_backend, output_dir_value, compression_preset):
+        def _build_from_ui(project_name, paper_faithful, quantization, teacher_model_id_or_path, teacher_load_mode, teacher_dtype, teacher_revision, trust_remote_code, dataset_type, dataset_name, dataset_path, dataset_split, text_field, sample_count, sequence_length, token_budget, train_steps, runtime_backend, local_num_gpus, local_allow_full_model_run, ssh_host, ssh_user, ssh_port, ssh_dry_run, skypilot_cluster_name, skypilot_accelerators, skypilot_cloud, skypilot_region, skypilot_image_id, skypilot_disk_size_gb, skypilot_autostop_minutes, skypilot_dry_run, worker_api_url, worker_auth_token_env, worker_timeout_seconds, kd_teacher_mode, offline_full_logits_cache_path, allow_smoke_trainer_value, tracking_backend, output_dir_value, compression_preset):
             return build_config_yaml(
                 project_name=project_name,
                 paper_faithful=paper_faithful,
@@ -375,11 +398,12 @@ def create_app(test_mode: bool = False):
                 worker_timeout_seconds=worker_timeout_seconds,
                 kd_teacher_mode=kd_teacher_mode,
                 offline_full_logits_cache_path=offline_full_logits_cache_path,
+                allow_smoke_trainer=allow_smoke_trainer_value,
             )
 
-        def _run_from_ui(command, *args, preset_value="balanced_50", stage_value=1, backend_value="local", checkpoint_value=None):
-            return run_cli_with_yaml(
-                _build_from_ui(*args, preset_value),
+        def _run_from_yaml(yaml_text, command, preset_value="balanced_50", stage_value=1, backend_value="local", checkpoint_value=None):
+            return run_ui_yaml_command(
+                yaml_text,
                 command,
                 preset=preset_value,
                 stage=int(stage_value),
@@ -425,6 +449,7 @@ def create_app(test_mode: bool = False):
             worker_timeout,
             kd_teacher_mode,
             offline_cache,
+            allow_smoke_trainer,
             tracking,
             output_dir,
         ]
@@ -438,10 +463,10 @@ def create_app(test_mode: bool = False):
             ("extreme_90", extreme_btn),
         ]:
             button.click(lambda selected=value: selected, outputs=[preset])
-        analyze_btn.click(lambda selected, *args: _run_from_ui("analyze", *args, preset_value=selected), inputs=[preset, *config_inputs], outputs=[analyze_out])
+        analyze_btn.click(lambda yaml_text, selected: _run_from_yaml(yaml_text, "analyze", preset_value=selected), inputs=[output, preset], outputs=[analyze_out])
         recommend_btn.click(
-            lambda selected, *args: _run_from_ui("recommend", *args, preset_value=selected),
-            inputs=[preset, *config_inputs],
+            lambda yaml_text, selected: _run_from_yaml(yaml_text, "recommend", preset_value=selected),
+            inputs=[output, preset],
             outputs=[recommend_out],
         )
         apply_candidate_btn.click(
@@ -450,26 +475,26 @@ def create_app(test_mode: bool = False):
             outputs=[output],
         ).then(config_warnings, inputs=[output], outputs=[warnings_out])
         compress_btn.click(
-            lambda stage_value, selected, *args: _run_from_ui("compress", *args, preset_value=selected, stage_value=stage_value),
-            inputs=[stage, preset, *config_inputs],
+            lambda yaml_text, stage_value, selected: _run_from_yaml(yaml_text, "compress", preset_value=selected, stage_value=stage_value),
+            inputs=[output, stage, preset],
             outputs=[compress_out],
         )
         distill_btn.click(
-            lambda stage_value, selected, *args: _run_from_ui("distill", *args, preset_value=selected, stage_value=stage_value),
-            inputs=[stage, preset, *config_inputs],
+            lambda yaml_text, stage_value, selected: _run_from_yaml(yaml_text, "distill", preset_value=selected, stage_value=stage_value),
+            inputs=[output, stage, preset],
             outputs=[distill_out],
         )
         eval_btn.click(
-            lambda checkpoint_value, selected, *args: _run_from_ui("eval", *args, preset_value=selected, checkpoint_value=checkpoint_value),
-            inputs=[eval_checkpoint, preset, *config_inputs],
+            lambda yaml_text, checkpoint_value, selected: _run_from_yaml(yaml_text, "eval", preset_value=selected, checkpoint_value=checkpoint_value),
+            inputs=[output, eval_checkpoint, preset],
             outputs=[eval_out],
         )
         launch_btn.click(
-            lambda backend_value, selected, *args: _run_from_ui("launch", *args, preset_value=selected, backend_value=backend_value),
-            inputs=[launch_backend, preset, *config_inputs],
+            lambda yaml_text, backend_value, selected: _run_from_yaml(yaml_text, "launch", preset_value=selected, backend_value=backend_value),
+            inputs=[output, launch_backend, preset],
             outputs=[launch_out],
         )
-        run_btn.click(lambda selected, *args: _run_from_ui("run", *args, preset_value=selected), inputs=[preset, *config_inputs], outputs=[run_out])
+        run_btn.click(lambda yaml_text, selected: _run_from_yaml(yaml_text, "run", preset_value=selected), inputs=[output, preset], outputs=[run_out])
         logs_btn.click(log_tail, inputs=[output_dir], outputs=[logs_out])
         artifacts_btn.click(artifact_index, inputs=[output_dir], outputs=[artifacts_out])
     return demo

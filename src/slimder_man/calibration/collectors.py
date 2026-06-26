@@ -119,16 +119,19 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
     moes = adapter.iter_moe_layers(model)
     hidden_sums = [torch.zeros(hidden_size, dtype=torch.float64) for _ in norms]
     hidden_counts = [0 for _ in norms]
-    expert_freq = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
-    expert_soft = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
-    expert_reap_num = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
-    expert_reap_count = [torch.zeros(len(adapter.get_routed_experts(moe)), dtype=torch.float64) for moe in moes]
-    weight_chunks = [[] for _ in moes]
-    logit_chunks = [[] for _ in moes]
+    expert_counts = [_adapter_expert_count(adapter, moe) for moe in moes]
+    expert_freq = [torch.zeros(n, dtype=torch.float64) for n in expert_counts]
+    expert_soft = [torch.zeros(n, dtype=torch.float64) for n in expert_counts]
+    expert_reap_num = [torch.zeros(n, dtype=torch.float64) for n in expert_counts]
+    expert_reap_count = [torch.zeros(n, dtype=torch.float64) for n in expert_counts]
+    weight_grams = [torch.zeros(n, n, dtype=torch.float64) for n in expert_counts]
+    weight_norms = [torch.zeros(n, dtype=torch.float64) for n in expert_counts]
+    logit_grams = [torch.zeros(n, n, dtype=torch.float64) for n in expert_counts]
+    logit_norms = [torch.zeros(n, dtype=torch.float64) for n in expert_counts]
     top_ks = [
-        min(len(adapter.get_routed_experts(moe)), max(1, int(architecture.moe_layers[idx].top_k)))
+        min(expert_counts[idx], max(1, int(architecture.moe_layers[idx].top_k)))
         if idx < len(architecture.moe_layers) and architecture.moe_layers[idx].top_k
-        else _moe_top_k(moe, len(adapter.get_routed_experts(moe)))
+        else _moe_top_k(moe, expert_counts[idx])
         for idx, moe in enumerate(moes)
     ]
     handles = []
@@ -160,7 +163,7 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
                     state.router_logits = None
                 _ = model(input_ids=batch)
                 for layer_idx, moe in enumerate(moes):
-                    n = len(adapter.get_routed_experts(moe))
+                    n = expert_counts[layer_idx]
                     traces = _resolve_moe_traces(adapter, moe, trace_states[layer_idx], n, top_ks[layer_idx])
                     if traces.used_hook_fallback:
                         used_hook_fallback = True
@@ -176,8 +179,8 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
                     dense_weights = torch.zeros(topi.shape[0], n)
                     for slot in range(topi.shape[1]):
                         dense_weights.scatter_add_(1, topi[:, slot : slot + 1].cpu(), topw[:, slot : slot + 1].cpu())
-                    weight_chunks[layer_idx].append(dense_weights)
-                    logit_chunks[layer_idx].append(logits.cpu())
+                    _update_cosine_accumulator(weight_grams[layer_idx], weight_norms[layer_idx], dense_weights)
+                    _update_cosine_accumulator(logit_grams[layer_idx], logit_norms[layer_idx], logits)
     finally:
         for h in handles:
             h.remove()
@@ -192,9 +195,9 @@ def collect_calibration(model, batches: list[torch.Tensor], adapter=None) -> Cal
         expert_frequency=[(x / denom).to(torch.float32) for x in expert_freq],
         expert_soft=[(x / denom).to(torch.float32) for x in expert_soft],
         expert_reap=[finalize_reap_importance(num, count).to(torch.float32) for num, count in zip(expert_reap_num, expert_reap_count, strict=True)],
-        expert_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
-        router_logits_similarity=[streaming_cosine(chunks) for chunks in logit_chunks],
-        router_weights_similarity=[streaming_cosine(chunks) for chunks in weight_chunks],
+        expert_similarity=[_cosine_from_accumulator(gram, norms) for gram, norms in zip(weight_grams, weight_norms, strict=True)],
+        router_logits_similarity=[_cosine_from_accumulator(gram, norms) for gram, norms in zip(logit_grams, logit_norms, strict=True)],
+        router_weights_similarity=[_cosine_from_accumulator(gram, norms) for gram, norms in zip(weight_grams, weight_norms, strict=True)],
         expert_layer_indices=expert_layer_indices,
         representation="router_hook_recomputed_expert_outputs" if used_hook_fallback else "post_softmax_topk_weights",
     )
@@ -264,7 +267,35 @@ def _moe_top_k(moe, num_experts: int) -> int:
     return min(num_experts, 2)
 
 
+def _adapter_expert_count(adapter, moe) -> int:
+    count_fn = getattr(adapter, "routed_expert_count", None)
+    if callable(count_fn):
+        return int(count_fn(moe))
+    return len(adapter.get_routed_experts(moe))
+
+
+def _update_cosine_accumulator(gram: torch.Tensor, norms: torch.Tensor, matrix: torch.Tensor) -> None:
+    x = matrix.detach().cpu().to(torch.float64)
+    gram.add_(x.T @ x)
+    norms.add_((x**2).sum(dim=0))
+
+
+def _cosine_from_accumulator(gram: torch.Tensor, norms: torch.Tensor) -> torch.Tensor:
+    denom = torch.sqrt(norms[:, None] * norms[None, :])
+    sim = torch.zeros_like(gram)
+    mask = denom > 0
+    sim[mask] = gram[mask] / denom[mask]
+    nonzero = norms > 0
+    sim[nonzero, nonzero] = 1.0
+    return sim.to(torch.float32)
+
+
 def _selected_expert_output_norm2(adapter, moe, hidden: torch.Tensor, topi: torch.Tensor, num_experts: int) -> torch.Tensor:
+    direct = getattr(adapter, "selected_expert_output_norm2", None)
+    if callable(direct):
+        result = direct(moe, hidden, topi, num_experts)
+        if result is not None:
+            return result
     experts = adapter.get_routed_experts(moe)
     norm2 = torch.zeros(topi.shape[0], num_experts, dtype=torch.float32)
     for slot in range(topi.shape[1]):

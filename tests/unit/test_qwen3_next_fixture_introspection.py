@@ -231,6 +231,54 @@ def test_official_qwen3_next_calibrates_compresses_saves_and_reloads(tmp_path: P
     assert out.loss is not None and torch.isfinite(out.loss)
 
 
+def test_official_qwen3_next_calibration_uses_packed_fast_path_without_materializing_experts(monkeypatch):
+    model = _official_tiny_qwen3_next()
+    adapter = Qwen3NextAdapter()
+    cfg = SlimderConfig(
+        project={"paper_faithful": False},
+        teacher={"load_mode": "transformers", "model_id_or_path": "official-tiny-qwen3-next"},
+        calibration={"sample_count": 2, "sequence_length": 8},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
+
+    def fail_get_routed_experts(_moe):
+        raise AssertionError("packed calibration should not materialize per-expert modules")
+
+    monkeypatch.setattr(adapter, "get_routed_experts", fail_get_routed_experts)
+    calibration = collect_calibration(model, batches, adapter)
+
+    assert [scores.numel() for scores in calibration.expert_frequency] == [4, 4]
+    assert [tuple(sim.shape) for sim in calibration.expert_similarity] == [(4, 4), (4, 4)]
+    assert all(torch.isfinite(scores).all() for scores in calibration.expert_soft)
+
+
+def test_official_qwen3_next_compression_uses_packed_fast_path_without_materializing_experts(monkeypatch, tmp_path: Path):
+    model = _official_tiny_qwen3_next()
+    adapter = Qwen3NextAdapter()
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path)},
+        teacher={"load_mode": "transformers", "model_id_or_path": "official-tiny-qwen3-next"},
+        student={"output_format": "hf_safetensors"},
+        calibration={"sample_count": 2, "sequence_length": 8},
+        compression={"target": {"hidden_size": 12, "remove_last_n_layers": 0, "routed_experts": 2, "routed_top_k": 1}},
+    )
+    batches, _ = sample_calibration_tokens(cfg.calibration, vocab_size=model.config.vocab_size)
+    calibration = collect_calibration(model, batches, adapter)
+
+    def fail_get_routed_experts(_moe):
+        raise AssertionError("packed compression should not materialize per-expert modules")
+
+    monkeypatch.setattr(adapter, "get_routed_experts", fail_get_routed_experts)
+    student, manifest = compress_model(model, cfg, calibration, adapter=adapter, output_dir=tmp_path / "packed_fast")
+
+    assert student.config.hidden_size == 12
+    assert student.config.num_experts == 2
+    assert student.model.layers[0].mlp.experts.gate_up_proj.shape == (2, 16, 12)
+    assert student.model.layers[0].mlp.experts.down_proj.shape == (2, 12, 8)
+    assert manifest["experts"]["layers"][0]["new_expert_order"]
+    assert (tmp_path / "packed_fast" / "compression_manifest.json").exists()
+
+
 def test_qwen3_next_adapter_destructive_methods_are_explicitly_covered(tmp_path: Path):
     config = DummyHfMoeConfig(model_type="qwen3_next")
     model = DummyHfMoeForCausalLM(config)

@@ -58,9 +58,12 @@ def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
     assert "-e \"ssh -p 2222 -i '" in joined
     assert "/id key'\"" in joined
     assert "run out/training/final" not in joined
-    assert any("cli analyze" in c for c in cmds)
-    assert any("cli compress" in c for c in cmds)
-    assert any("cli distill" in c for c in cmds)
+    assert any("cli recommend --config" in c and "--write-config" in c for c in cmds)
+    assert any("cli run ~/slimder-man/configs/launch_config.yaml --json > logs/run.log" in c for c in cmds)
+    assert not any("cli analyze" in c for c in cmds)
+    assert not any("cli compress" in c for c in cmds)
+    assert not any("cli distill" in c for c in cmds)
+    assert not any("cli eval" in c for c in cmds)
     assert any("tail -n 200 -f" in c for c in cmds)
     assert any("pkill -f slimder_man.cli" in c for c in cmds)
     yml = skypilot_yaml(config_path, cfg)
@@ -72,9 +75,12 @@ def test_ssh_and_skypilot_dry_runs_redact(tmp_path: Path):
     assert yml_data["file_mounts"]["configs/source_config.yaml"] == str(config_path)
     assert "configs/launch_config.yaml" in yml
     assert "outputs/run-out" in yml
-    assert "slimder_man.cli analyze" in yml
-    assert "slimder_man.cli compress" in yml
-    assert "slimder_man.cli distill" in yml
+    assert "slimder_man.cli recommend --config configs/launch_config.yaml" in yml
+    assert "slimder_man.cli run configs/launch_config.yaml --json | tee logs/run.log" in yml
+    assert "slimder_man.cli analyze" not in yml
+    assert "slimder_man.cli compress" not in yml
+    assert "slimder_man.cli distill" not in yml
+    assert "slimder_man.cli eval" not in yml
     assert "HF_TOKEN" in yml
     assert "hf_***REDACTED***" in redact_secret("token=hf_abcdef123")
     assert "hf_dummy.yaml" in redact_secret("src/slimder_man/config/examples/hf_dummy.yaml")
@@ -131,7 +137,7 @@ def test_skypilot_runner_launches_streams_and_syncs_with_fake_executor(tmp_path:
 
     assert result.status == "succeeded"
     assert task_path.exists()
-    assert "slimder_man.cli analyze" in task_path.read_text(encoding="utf-8")
+    assert "slimder_man.cli run configs/launch_config.yaml --json | tee logs/run.log" in task_path.read_text(encoding="utf-8")
     assert executor.commands[0].startswith("sky launch -c slimder-test")
     assert logs == ["log-line-1", "token=hf_***REDACTED***"]
     assert stop.ok and executor.commands[2] == "sky stop slimder-test --yes"
@@ -170,23 +176,24 @@ def test_ssh_runner_stops_on_failed_required_preflight(tmp_path: Path):
     assert not any("pip install -e" in command for command in executor.commands)
 
 
-def test_ssh_runner_executes_ordered_stages_and_stops_on_failure(tmp_path: Path):
+def test_ssh_runner_executes_ordered_pipeline_and_stops_on_failure(tmp_path: Path):
     config_path = tmp_path / "launch.yaml"
     cfg = SlimderConfig(
         project={"paper_faithful": False, "output_dir": str(tmp_path / "run")},
         runtime={"ssh": {"host": "host", "user": "user", "dry_run": False}},
     )
     save_config(cfg, config_path)
-    executor = RecordingExecutor(fail_on="cli compress")
+    executor = RecordingExecutor(fail_on="cli run ~/slimder-man/configs/launch_config.yaml --json")
 
     result = SSHRunner(config_path, cfg, executor=executor).launch()
 
     assert result.status == "failed"
-    assert result.failed_command is not None and "cli compress" in result.failed_command
+    assert result.failed_command is not None and "cli run" in result.failed_command
     assert any("materialize_config" in command for command in executor.commands)
-    assert any("cli analyze" in command for command in executor.commands)
     assert any("cli recommend" in command for command in executor.commands)
-    assert any("cli compress" in command for command in executor.commands)
+    assert any("cli run" in command for command in executor.commands)
+    assert not any("cli analyze" in command for command in executor.commands)
+    assert not any("cli compress" in command for command in executor.commands)
     assert not any("cli distill" in command for command in executor.commands)
     assert not any("tail -n 200 -f" in command for command in executor.commands)
 

@@ -406,11 +406,26 @@ def compress_model(
         original_layer_idx = kept_moe_layer_indices[layer_idx] if layer_idx < len(kept_moe_layer_indices) else layer_idx
         scores = _resolve_expert_importance(calibration, cfg.compression.experts.importance_metric, original_layer_idx)
         sim = _resolve_expert_similarity(calibration, cfg.compression.experts.similarity_metric, original_layer_idx)
-        experts = adapter.get_routed_experts(moe)
-        old_router_rows = adapter.get_router(moe).weight.detach().clone()
-        new_experts, plan = _select_or_merge_experts(experts, scores, sim, target.routed_experts, cfg.compression.experts.method)
-        rows = router_rows_for_merge(old_router_rows, plan.s_keep, plan.s_base, cfg.compression.experts.router_row_strategy)
-        adapter.replace_experts(moe, new_experts, rows, target.routed_top_k)
+        direct_merge = getattr(adapter, "merge_or_prune_packed_experts", None)
+        plan = (
+            direct_merge(
+                moe,
+                scores,
+                sim,
+                target.routed_experts,
+                cfg.compression.experts.method,
+                cfg.compression.experts.router_row_strategy,
+                target.routed_top_k,
+            )
+            if callable(direct_merge)
+            else None
+        )
+        if plan is None:
+            experts = adapter.get_routed_experts(moe)
+            old_router_rows = adapter.get_router(moe).weight.detach().clone()
+            new_experts, plan = _select_or_merge_experts(experts, scores, sim, target.routed_experts, cfg.compression.experts.method)
+            rows = router_rows_for_merge(old_router_rows, plan.s_keep, plan.s_base, cfg.compression.experts.router_row_strategy)
+            adapter.replace_experts(moe, new_experts, rows, target.routed_top_k)
         expert_layers.append(
             {
                 "layer_idx": original_layer_idx,

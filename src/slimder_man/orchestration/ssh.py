@@ -56,6 +56,12 @@ def _guarded_preflight_command(ssh_base: str, probe_command: str, actionable_fai
     return _ssh_call(ssh_base, f"{probe_command} || (echo {_quote(actionable_failure)} && exit 1)")
 
 
+def _recommend_config_only_flag(cfg: SlimderConfig) -> str:
+    if cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe":
+        return " --config-only"
+    return ""
+
+
 def ssh_command_plan(
     config_path: str | Path,
     cfg: SlimderConfig,
@@ -125,6 +131,13 @@ def ssh_command_plan(
             ),
         ),
         SSHCommand(
+            "resolve_plan",
+            _ssh_call(
+                ssh_base,
+                f"cd {remote_root} && mkdir -p logs && python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --write-config {remote_config}{_recommend_config_only_flag(cfg)} --json > logs/recommend.log 2>&1",
+            ),
+        ),
+        SSHCommand(
             "dry_run_gate",
             _ssh_call(
                 ssh_base,
@@ -132,38 +145,10 @@ def ssh_command_plan(
             ),
         ),
         SSHCommand(
-            "analyze",
+            "run_pipeline",
             _ssh_call(
                 ssh_base,
-                f"cd {remote_root} && mkdir -p logs && python -m slimder_man.cli analyze {remote_config} --json > logs/analyze.log 2>&1",
-            ),
-        ),
-        SSHCommand(
-            "recommend",
-            _ssh_call(
-                ssh_base,
-                f"cd {remote_root} && python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --write-config {remote_config} --json > logs/recommend.log 2>&1",
-            ),
-        ),
-        SSHCommand(
-            "compress",
-            _ssh_call(
-                ssh_base,
-                f"cd {remote_root} && python -m slimder_man.cli compress --config {remote_config} --stage 1 --json > logs/compress.log 2>&1",
-            ),
-        ),
-        SSHCommand(
-            "distill",
-            _ssh_call(
-                ssh_base,
-                f"cd {remote_root} && python -m slimder_man.cli distill {remote_config} --stage 1 --json > logs/distill.log 2>&1",
-            ),
-        ),
-        SSHCommand(
-            "eval",
-            _ssh_call(
-                ssh_base,
-                f"cd {remote_root} && python -m slimder_man.cli eval --checkpoint {remote_run}/training/final --json > logs/eval.log 2>&1",
+                f"cd {remote_root} && python -m slimder_man.cli run {remote_config} --json > logs/run.log 2>&1",
             ),
         ),
         SSHCommand("logs", _ssh_call(ssh_base, f"tail -n 200 -f {remote_root}/logs/*.log"), execute_in_launch=False),

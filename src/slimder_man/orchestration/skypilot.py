@@ -18,6 +18,12 @@ def _safe_remote_name(value: str | Path, fallback: str = "run") -> str:
     return safe or fallback
 
 
+def _recommend_config_only_flag(cfg: SlimderConfig) -> str:
+    if cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe":
+        return " --config-only"
+    return ""
+
+
 @dataclass
 class SkyPilotPlan:
     yaml: str
@@ -73,16 +79,13 @@ def skypilot_yaml(config_path: str | Path, cfg: SlimderConfig) -> str:
             "python -m pip install --upgrade pip",
             "python -m pip install -e .[dev]",
             f"python -m slimder_man.orchestration.materialize_config {source_config} {remote_config} --output-dir {remote_run} --json",
+            f"python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --write-config {remote_config}{_recommend_config_only_flag(cfg)} --json",
             f"python -m slimder_man.cli run {remote_config} --dry-run --json",
         ]),
         "run": "\n".join([
             "set -euo pipefail",
             "mkdir -p logs",
-            f"python -m slimder_man.cli analyze {remote_config} --json | tee logs/analyze.log",
-            f"python -m slimder_man.cli recommend --config {remote_config} --preset {cfg.compression.preset} --write-config {remote_config} --json | tee logs/recommend.log",
-            f"python -m slimder_man.cli compress --config {remote_config} --stage 1 --json | tee logs/compress.log",
-            f"python -m slimder_man.cli distill {remote_config} --stage 1 --json | tee logs/distill.log",
-            f"python -m slimder_man.cli eval --checkpoint {remote_run}/training/final --json | tee logs/eval.log",
+            f"python -m slimder_man.cli run {remote_config} --json | tee logs/run.log",
             f"echo 'Artifacts are under {remote_run}; use sky rsync-down for retrieval.'",
         ]),
     }
