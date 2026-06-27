@@ -22,9 +22,10 @@ Real Qwen3-Next-80B work remains hardware-gated: local full-model execution
 requires explicit `runtime.local.allow_full_model_run=true`, and default CI uses
 synthetic/tiny/HF-dummy fixtures rather than downloading the real 80B checkpoint.
 The same guardrails apply to Qwen3.6-35B-A3B: config-only analysis and
-recommendation are safe locally, while real compression/distillation should use
-SSH, SkyPilot, or a Worker API endpoint with high-memory GPUs and full-logit
-teacher access.
+recommendation are safe locally, and the local app is intended to drive the
+real run as a controller. The teacher/student load, compression, distillation,
+and eval should happen on an SSH host, SkyPilot cluster, or Worker API endpoint
+with high-memory GPUs and full-logit teacher access.
 
 Quick local checks:
 
@@ -94,7 +95,9 @@ reports the bf16/fp16 teacher-weight floor, teacher+student training floor, and
 whether API use is compatible with paper-faithful KD. A generic chat-completions
 API is not enough for paper-faithful distillation unless the service also
 returns exact full-vocabulary logits; use online remote logits, an exact
-full-logit cache, or `remote_worker_full_logits`.
+full-logit cache, or `remote_worker_full_logits`. The Worker API launch path
+submits the local YAML to the remote server as job input, then streams status,
+logs, and artifacts back to the local controller.
 
 For SSH/SkyPilot configs, `runtime.ssh.dry_run=false` or
 `runtime.skypilot.dry_run=false` switches `slimder launch` from plan generation

@@ -117,6 +117,13 @@ def compute_guidance(cfg: SlimderConfig, architecture: dict[str, Any] | None = N
             "paper_faithful": cfg.project.paper_faithful,
             "kd_teacher_mode": cfg.kd.teacher_mode,
         },
+        "execution_model": {
+            "local_controller_supported": True,
+            "local_controller_role": "The local app edits config, submits jobs, streams logs, and syncs artifacts; it does not need to load the teacher when backend is ssh/skypilot/worker.",
+            "remote_execution_backends": ["ssh", "skypilot", "worker"],
+            "remote_executor_role": "The remote executor loads the teacher/student, runs calibration, compression, distillation, evaluation, and writes artifacts.",
+            "worker_api_submits_config_text": True,
+        },
         "local": local_fit,
         "remote": remote,
         "api": api_guidance,
@@ -142,6 +149,10 @@ def compute_guidance_markdown(guidance: dict[str, Any]) -> str:
         "",
         "## Recommended path",
         guidance["recommended_path"],
+        "",
+        "## Execution model",
+        guidance["execution_model"]["local_controller_role"],
+        guidance["execution_model"]["remote_executor_role"],
         "",
         "## Local",
         guidance["local"]["summary"],
@@ -223,9 +234,9 @@ def _local_fit_notes(profile: ModelProfile, cfg: SlimderConfig, weight_memory: d
         return {
             "status": "not_recommended_for_full_framework",
             "summary": (
-                "Local full-framework compression/distillation is not recommended for this model unless the machine has "
-                "multiple high-memory GPUs. Config-only recommend/analyze is fine locally; quantized inference may fit on "
-                "workstations, but it does not provide the full logits needed for paper-faithful KD."
+                "Run Slimder locally as the controller/UI for this model. The local machine can safely do config-only "
+                "recommend/analyze, launch remote jobs, stream logs, and sync artifacts. Do not make the local workstation "
+                "load the full teacher unless it has explicit high-memory GPU capacity."
             ),
             "minimum_vram_for_teacher_bf16_gb": round(weight_memory["fp16"] * 1.25, 1),
             "quantized_inference_note": "A 4-bit runtime can be useful for manual inspection, but Slimder should use remote GPUs for compression/distillation.",
@@ -247,7 +258,7 @@ def _remote_guidance(profile: ModelProfile, cfg: SlimderConfig, teacher_mem: dic
     return {
         "status": "recommended",
         "summary": (
-            f"Use SSH, SkyPilot, or the Worker API for this model. Minimum: {min_gpu} "
+            f"Use SSH, SkyPilot, or the Worker API so the remote server loads and trains the model. Minimum: {min_gpu} "
             f"Recommended: {recommended}"
         ),
         "minimum": min_gpu,
@@ -260,8 +271,9 @@ def _remote_guidance(profile: ModelProfile, cfg: SlimderConfig, teacher_mem: dic
 def _api_guidance(cfg: SlimderConfig) -> dict[str, Any]:
     if cfg.project.paper_faithful:
         summary = (
-            "Paper-faithful distillation requires exact full-vocabulary teacher logits. A generic chat-completions API is not enough. "
-            "Use online local logits on remote GPUs, an exact full-logit cache, or a Worker API endpoint that returns full logits."
+            "The Worker API can submit and run the whole training job on a remote server. For paper-faithful distillation, teacher supervision "
+            "must still be exact full-vocabulary logits. A generic chat-completions API alone is not enough; use online logits on the remote "
+            "executor, an exact full-logit cache, or a Worker API endpoint that returns full logits."
         )
         status = "full_logits_required"
     else:
@@ -279,8 +291,9 @@ def _recommended_path(cfg: SlimderConfig, profile: ModelProfile) -> str:
         return "Run locally on CPU for smoke validation."
     if profile.total_params_b >= 30:
         return (
-            "Start locally with config-only recommend/dry-run, then launch through SkyPilot/SSH/Worker on high-memory GPUs. "
-            "Use self-hosted full-logit teacher access for KD; reserve chat APIs for non-paper-faithful auxiliary workflows."
+            "Run the Slimder app locally as the controller, materialize the plan locally with config-only commands, then launch the actual "
+            "calibration/compression/training job through SkyPilot, SSH, or Worker API on high-memory GPUs. Use self-hosted full-logit teacher "
+            "access for KD; reserve chat APIs for non-paper-faithful auxiliary workflows."
         )
     return "Use local GPU if the dry-run/preflight confirms memory headroom; otherwise use SSH or SkyPilot."
 
@@ -292,7 +305,7 @@ def _next_steps(cfg: SlimderConfig) -> list[str]:
         "Run `slimder run <cfg> --dry-run --json` and inspect compute_guidance before launching.",
     ]
     if cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe":
-        steps.append("Prefer `slimder launch --backend skypilot` or `--backend ssh` for the real run; avoid local full-model execution unless explicitly provisioned.")
+        steps.append("Use `slimder launch --backend skypilot`, `--backend ssh`, or `--backend worker` for the real run; the remote executor loads and trains the model.")
     if cfg.project.paper_faithful:
         steps.append("Keep `kd.teacher_mode` on `online_full_logits`, `offline_full_logits_cache`, or `remote_worker_full_logits` with exact full distributions.")
     return steps

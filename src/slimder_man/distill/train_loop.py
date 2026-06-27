@@ -83,10 +83,11 @@ def _is_arbitrary_transformers_checkpoint(cfg: SlimderConfig) -> bool:
 
 
 def _validate_smoke_trainer_allowed(cfg: SlimderConfig) -> None:
-    if _is_arbitrary_transformers_checkpoint(cfg) and not cfg.training.allow_smoke_trainer:
+    if _is_arbitrary_transformers_checkpoint(cfg) and cfg.runtime.backend == "local" and not cfg.training.allow_smoke_trainer:
         raise ValueError(
-            "The single-process smoke distillation trainer is disabled for arbitrary Transformers checkpoints. "
-            "Set training.allow_smoke_trainer=true only for explicit small-model smoke runs; use a distributed engine for production training."
+            "Local single-process distillation is disabled for arbitrary Transformers checkpoints. "
+            "Set training.allow_smoke_trainer=true only for explicit local smoke runs, or set runtime.backend to ssh/skypilot/worker "
+            "so a remote executor loads and trains the model."
         )
 
 
@@ -472,7 +473,7 @@ def run_train_loop_entrypoint(
         return {"entrypoint": "slimder_man.distill.train_loop", "mode": "tiny", **result}
 
     if cfg.teacher.model_id_or_path != "dummy-hf-moe":
-        if not cfg.runtime.local.allow_full_model_run:
+        if cfg.runtime.backend == "local" and not cfg.runtime.local.allow_full_model_run:
             raise ValueError(
                 "train_loop entrypoint for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true "
                 "to avoid accidental full-model downloads. Pass --checkpoint with a compressed student checkpoint and opt in explicitly."

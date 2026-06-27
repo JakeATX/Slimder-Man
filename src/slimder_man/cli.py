@@ -169,7 +169,7 @@ def _requires_applied_plan(cfg: SlimderConfig) -> bool:
 
 
 def _requires_smoke_trainer_opt_in(cfg: SlimderConfig) -> bool:
-    return cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe"
+    return cfg.runtime.backend == "local" and cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe"
 
 
 def _reject_missing_required_plan(cfg: SlimderConfig) -> None:
@@ -183,8 +183,9 @@ def _reject_missing_required_plan(cfg: SlimderConfig) -> None:
 def _reject_disabled_smoke_trainer(cfg: SlimderConfig) -> None:
     if _requires_smoke_trainer_opt_in(cfg) and not cfg.training.allow_smoke_trainer:
         raise typer.BadParameter(
-            "The single-process smoke distillation trainer is disabled for arbitrary Transformers checkpoints. "
-            "Set training.allow_smoke_trainer=true only for explicit small-model smoke runs; use remote/distributed launch for production."
+            "Local single-process distillation is disabled for arbitrary Transformers checkpoints. "
+            "Set training.allow_smoke_trainer=true only for explicit local smoke runs, or set runtime.backend to ssh/skypilot/worker "
+            "so a remote executor loads and trains the model."
         )
 
 
@@ -558,7 +559,7 @@ def run(config: Path, dry_run: bool = typer.Option(False, "--dry-run"), json_out
         _echo(_dry_run_plan(cfg, config), json_output)
         return
     if cfg.teacher.load_mode != "tiny":
-        if cfg.teacher.model_id_or_path != "dummy-hf-moe" and not cfg.runtime.local.allow_full_model_run:
+        if cfg.runtime.backend == "local" and cfg.teacher.model_id_or_path != "dummy-hf-moe" and not cfg.runtime.local.allow_full_model_run:
             raise typer.BadParameter(
                 "Full local run for arbitrary Transformers checkpoints requires runtime.local.allow_full_model_run=true. "
                 "Use --dry-run, explicit staged analyze/compress/distill commands, or remote launch for large checkpoints."

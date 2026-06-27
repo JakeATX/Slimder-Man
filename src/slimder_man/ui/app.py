@@ -254,8 +254,13 @@ def config_warnings(yaml_text: str) -> str:
         warnings.append("Non-paper-faithful mode enables augmented behavior; manifests should be reviewed for contamination.")
     if cfg.teacher.load_mode == "transformers" and cfg.runtime.backend == "local" and not cfg.runtime.local.allow_full_model_run:
         warnings.append("Arbitrary Transformers local run requires runtime.local.allow_full_model_run=true; use launch/dry-run for large checkpoints.")
-    if cfg.teacher.load_mode == "transformers" and cfg.teacher.model_id_or_path != "dummy-hf-moe" and not cfg.training.allow_smoke_trainer:
-        warnings.append("Single-process Transformers distillation requires training.allow_smoke_trainer=true and should be limited to explicit small-model smoke runs.")
+    if (
+        cfg.teacher.load_mode == "transformers"
+        and cfg.teacher.model_id_or_path != "dummy-hf-moe"
+        and cfg.runtime.backend == "local"
+        and not cfg.training.allow_smoke_trainer
+    ):
+        warnings.append("Local Transformers distillation requires training.allow_smoke_trainer=true; remote backends load and train on the remote executor.")
     return "\n".join(warnings) if warnings else "No warnings."
 
 

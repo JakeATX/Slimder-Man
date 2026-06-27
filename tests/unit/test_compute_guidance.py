@@ -32,9 +32,11 @@ def test_qwen36_compute_guidance_profile_and_memory(tmp_path: Path):
     assert guidance["model"]["top_k"] == 8
     assert guidance["memory_estimates_gb"]["teacher_weights_fp16_or_bf16"] == 70.0
     assert guidance["local"]["status"] == "not_recommended_for_full_framework"
+    assert guidance["execution_model"]["local_controller_supported"] is True
+    assert "remote executor" in guidance["execution_model"]["remote_executor_role"]
     assert guidance["remote"]["status"] == "recommended"
     assert guidance["api"]["status"] == "full_logits_required"
-    assert "remote full-logit worker" in guidance["api"]["summary"] or "full-vocabulary teacher logits" in guidance["api"]["summary"]
+    assert "full-vocabulary logits" in guidance["api"]["summary"]
 
 
 def test_compute_guidance_markdown_is_user_actionable(tmp_path: Path):
@@ -76,7 +78,7 @@ def test_qwen36_example_config_parses_and_defaults_to_remote_dry_run():
     assert cfg.runtime.local.allow_full_model_run is False
     assert cfg.runtime.skypilot.dry_run is True
     assert cfg.training.allow_smoke_trainer is False
-    assert compute_guidance(cfg)["recommended_path"].startswith("Start locally with config-only")
+    assert compute_guidance(cfg)["recommended_path"].startswith("Run the Slimder app locally as the controller")
 
 
 def test_unknown_architecture_guidance_uses_architecture_fallback(tmp_path: Path):

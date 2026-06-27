@@ -429,6 +429,34 @@ def test_run_rejects_non_dummy_transformers_without_smoke_trainer_opt_in(monkeyp
     assert loaded is False
 
 
+def test_run_remote_backend_passes_local_safety_gates_before_remote_model_load(monkeypatch, tmp_path: Path):
+    from slimder_man import cli
+    from slimder_man.analyze.architecture import describe_model
+    from slimder_man.analyze.plans import apply_recommendation_to_config
+
+    cfg = SlimderConfig(
+        project={"paper_faithful": False, "output_dir": str(tmp_path / "out")},
+        teacher={"load_mode": "transformers", "model_id_or_path": "Qwen/Qwen3.6-35B-A3B"},
+        runtime={"backend": "skypilot", "skypilot": {"dry_run": False}},
+        compression={"target": {"hidden_size": 12, "remove_last_n_layers": 1, "routed_experts": 4, "routed_top_k": 2}},
+    )
+    cfg, _ = apply_recommendation_to_config(cfg, describe_model(DummyHfMoeForCausalLM()), preset="balanced_50")
+    config_path = tmp_path / "qwen36_remote.yaml"
+    config_path.write_text(yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8")
+
+    def remote_executor_would_load(_cfg):
+        raise RuntimeError("remote executor reached model load")
+
+    monkeypatch.setattr(cli, "_load_model", remote_executor_would_load)
+
+    result = CliRunner().invoke(app, ["run", str(config_path), "--json"])
+
+    assert result.exit_code != 0
+    assert "remote executor reached model load" in str(result.exception)
+    assert "allow_full_model_run=true" not in result.output
+    assert "allow_smoke_trainer=true" not in result.output
+
+
 def test_run_accepts_opted_in_non_dummy_transformers_through_generic_hf_pipeline(monkeypatch, tmp_path: Path):
     from slimder_man import cli
 
